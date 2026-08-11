@@ -40,6 +40,9 @@ outputs:
   size-in-bytes:
     description: Size of the uploaded package.
     value: ${{ steps.upload.outputs.size-in-bytes }}
+  sha256:
+    description: SHA-256 of the built package that was uploaded.
+    value: ${{ steps.upload.outputs.sha256 }}
 
 runs:
   using: composite
@@ -77,6 +80,15 @@ runs:
           tag_name="$GITHUB_REF_NAME"
         fi
 
+        run_url="${GITHUB_SERVER_URL%/}/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        if [ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]; then
+          run_url="$run_url/attempts/$GITHUB_RUN_ATTEMPT"
+        fi
+
+        # The digest of exactly what is being sent, printed at the end so it can be checked
+        # against what the Platform recorded.
+        artifact_sha256="$(sha256sum "$MD_ARTIFACT" | cut -d' ' -f1)"
+
         workdir="$(mktemp -d)"
         trap 'rm -rf "$workdir"' EXIT
         artifact_name="$(basename "$MD_ARTIFACT")"
@@ -90,12 +102,20 @@ runs:
           --arg commitSha "$GITHUB_SHA" \
           --arg tagName "$tag_name" \
           --arg changelog "$MD_CHANGELOG" \
+          --arg buildRepository "$GITHUB_REPOSITORY" \
+          --argjson buildRunId "$GITHUB_RUN_ID" \
+          --argjson buildRunAttempt "$GITHUB_RUN_ATTEMPT" \
+          --arg buildRunUrl "$run_url" \
           '{
              schemaVersion: 1,
              packageId: $packageId,
              version: $version,
              artifactFileName: $artifactFileName,
-             commitSha: $commitSha
+             commitSha: $commitSha,
+             buildRepository: $buildRepository,
+             buildRunId: $buildRunId,
+             buildRunAttempt: $buildRunAttempt,
+             buildRunUrl: $buildRunUrl
            }
            + (if $tagName == "" then {} else { tagName: $tagName } end)
            + (if $changelog == "" then {} else { changelog: $changelog } end)' \
@@ -126,6 +146,22 @@ runs:
         {
           echo "version=$(jq -r '.version' "$response")"
           echo "size-in-bytes=$(jq -r '.sizeInBytes' "$response")"
+          echo "sha256=$artifact_sha256"
         } >> "$GITHUB_OUTPUT"
 
+        {
+          echo "### Macro Deck package uploaded"
+          echo
+          echo "| | |"
+          echo "| --- | --- |"
+          echo "| Package | \`$MD_PACKAGE_ID\` |"
+          echo "| Version | \`$version\` |"
+          echo "| SHA-256 | \`$artifact_sha256\` |"
+          echo "| Commit | \`$GITHUB_SHA\` |"
+          echo
+          echo "The digest above is of the built package this run uploaded."
+          echo "It must match what the Creator Portal shows for this version."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo "SHA-256 of the uploaded package: $artifact_sha256"
         echo "Uploaded. It now awaits review in the Creator Portal."
