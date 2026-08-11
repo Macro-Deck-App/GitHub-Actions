@@ -1,0 +1,131 @@
+name: Upload Macro Deck package
+description: >-
+  Packs a built Macro Deck package together with its build metadata and uploads it to the
+  Macro Deck Platform, where it attaches to the version currently being prepared.
+author: Macro Deck
+
+branding:
+  icon: upload-cloud
+  color: purple
+
+inputs:
+  token:
+    description: >-
+      Publishing token, created in the Creator Portal. Pass it from a secret - never inline.
+    required: true
+  package-id:
+    description: Package identifier in reverse-DNS form, for example com.suchbyte.my-plugin.
+    required: true
+  artifact:
+    description: Path to the built package, for example dist/my-plugin.macroDeckPlugin.
+    required: true
+  version:
+    description: >-
+      Version to publish. Defaults to the tag that triggered the run, with a leading "v" removed.
+    required: false
+    default: ''
+  changelog:
+    description: Release notes for this version, as CommonMark.
+    required: false
+    default: ''
+  api-url:
+    description: Base URL of the Macro Deck Platform API.
+    required: false
+    default: https://api.macro-deck.app
+
+outputs:
+  version:
+    description: The version that was uploaded.
+    value: ${{ steps.upload.outputs.version }}
+  size-in-bytes:
+    description: Size of the uploaded package.
+    value: ${{ steps.upload.outputs.size-in-bytes }}
+
+runs:
+  using: composite
+  steps:
+    - id: upload
+      shell: bash
+      env:
+        # Passed through the environment rather than interpolated into the script, so a value
+        # containing quotes or backticks cannot become part of the command.
+        MD_TOKEN: ${{ inputs.token }}
+        MD_PACKAGE_ID: ${{ inputs.package-id }}
+        MD_ARTIFACT: ${{ inputs.artifact }}
+        MD_VERSION: ${{ inputs.version }}
+        MD_CHANGELOG: ${{ inputs.changelog }}
+        MD_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$MD_ARTIFACT" ]; then
+          echo "::error::No built package at '$MD_ARTIFACT'." >&2
+          exit 1
+        fi
+
+        version="$MD_VERSION"
+        if [ -z "$version" ]; then
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::No version given and this run was not triggered by a tag." >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+        fi
+
+        tag_name=""
+        if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+          tag_name="$GITHUB_REF_NAME"
+        fi
+
+        workdir="$(mktemp -d)"
+        trap 'rm -rf "$workdir"' EXIT
+        artifact_name="$(basename "$MD_ARTIFACT")"
+        cp "$MD_ARTIFACT" "$workdir/$artifact_name"
+
+        # jq builds the metadata so every value is correctly escaped, whatever it contains.
+        jq -n \
+          --arg packageId "$MD_PACKAGE_ID" \
+          --arg version "$version" \
+          --arg artifactFileName "$artifact_name" \
+          --arg commitSha "$GITHUB_SHA" \
+          --arg tagName "$tag_name" \
+          --arg changelog "$MD_CHANGELOG" \
+          '{
+             schemaVersion: 1,
+             packageId: $packageId,
+             version: $version,
+             artifactFileName: $artifactFileName,
+             commitSha: $commitSha
+           }
+           + (if $tagName == "" then {} else { tagName: $tagName } end)
+           + (if $changelog == "" then {} else { changelog: $changelog } end)' \
+          > "$workdir/build-metadata.json"
+
+        archive="$workdir/build.zip"
+        (cd "$workdir" && zip -q -X "$archive" build-metadata.json "$artifact_name")
+
+        echo "Uploading $MD_PACKAGE_ID $version ($(wc -c < "$archive") bytes)"
+        response="$workdir/response.json"
+        status="$(curl --silent --show-error \
+          --write-out '%{http_code}' \
+          --output "$response" \
+          --request POST \
+          --header "Authorization: Bearer $MD_TOKEN" \
+          --header 'Content-Type: application/zip' \
+          --data-binary "@$archive" \
+          "${MD_API_URL%/}/api/v1/builds")"
+
+        if [ "$status" != "200" ]; then
+          echo "::error::The upload failed with HTTP $status." >&2
+          # The body carries a problem detail explaining why; it holds no secrets.
+          cat "$response" >&2 || true
+          echo >&2
+          exit 1
+        fi
+
+        {
+          echo "version=$(jq -r '.version' "$response")"
+          echo "size-in-bytes=$(jq -r '.sizeInBytes' "$response")"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Uploaded. It now awaits review in the Creator Portal."
