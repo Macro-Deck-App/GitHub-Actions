@@ -24,8 +24,9 @@ on:
       version:
         description: >-
           The version this build declares; one leading `v` is dropped, so a tag name can be passed
-          as-is. It must match the version in the plugin's manifest.json. A release started from the
-          build in the Creator Portal takes this number.
+          as-is. It is written into the plugin's manifest.json and set as the assembly version, so
+          the version in the repository does not matter. A release started from the build in the
+          Creator Portal takes this number.
         required: true
         type: string
       build:
@@ -98,8 +99,9 @@ jobs:
 
       # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
       # which only `macrodeck-plugin build` assembles.
-      # Never name an env var VERSION here: MSBuild reads it as $(Version), a tag like v1.0.2 is
-      # not a valid package version, and restore then fails without logging why.
+      # MSBuild reads environment variables as properties, so Version= below becomes the assembly
+      # version. The same is why the input is not in an env var named VERSION: with its `v` intact
+      # it is not a valid package version, and restore fails without logging why.
       - name: Build and pack
         env:
           SOURCE: ${{ inputs.source }}
@@ -107,12 +109,10 @@ jobs:
         run: |
           set -euo pipefail
           declared="${DECLARED_VERSION#v}"
-          manifest_version="$(jq -r '.version' "${SOURCE}/manifest.json")"
-          if [ "${manifest_version}" != "${declared}" ]; then
-            echo "::error::manifest.json declares ${manifest_version}, but this release is ${declared}."
-            exit 1
-          fi
-          macrodeck-plugin build --source "${SOURCE}" --output "${RUNNER_TEMP}/artifacts"
+          jq --arg version "${declared}" '.version = $version' "${SOURCE}/manifest.json" \
+            > "${RUNNER_TEMP}/manifest.json"
+          mv "${RUNNER_TEMP}/manifest.json" "${SOURCE}/manifest.json"
+          Version="${declared}" macrodeck-plugin build --source "${SOURCE}" --output "${RUNNER_TEMP}/artifacts"
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. Every provenance value - repository, commit, tag, run - is read from the

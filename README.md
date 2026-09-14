@@ -36,8 +36,9 @@ project's build library in the Creator Portal, where a release is started from i
 - No secret is involved. The job authenticates with a GitHub Actions OIDC token; the
   Platform reads repository, commit, tag and run from it and accepts it only from this
   workflow at a `v*` tag, and only for the repository connected to the project.
-- The release's tag must match the version in the plugin's `manifest.json` (one leading
-  `v` is dropped). The build number defaults to the run number.
+- The release's tag is the version (one leading `v` is dropped): the workflow writes it into
+  the plugin's `manifest.json` and builds with it as the assembly version. The build number
+  defaults to the run number.
 
 ## Inputs
 
