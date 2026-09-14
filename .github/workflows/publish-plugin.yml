@@ -96,27 +96,17 @@ jobs:
             dotnet tool install --global MacroDeck.Plugin.Cli --prerelease
           fi
 
-      # Restores every target the CLI will build before it runs. A first restore inside
-      # `macrodeck-plugin build` on a fresh runner has failed with no error logged, while the same
-      # build succeeds once the packages are cached; a failure here also shows its real error.
-      - name: Restore
-        env:
-          SOURCE: ${{ inputs.source }}
-        run: |
-          set -euo pipefail
-          for rid in $(jq -r '.targets | keys[]' "${SOURCE}/macrodeck-build.json"); do
-            dotnet restore "${SOURCE}" -r "${rid}"
-          done
-
       # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
       # which only `macrodeck-plugin build` assembles.
+      # Never name an env var VERSION here: MSBuild reads it as $(Version), a tag like v1.0.2 is
+      # not a valid package version, and restore then fails without logging why.
       - name: Build and pack
         env:
           SOURCE: ${{ inputs.source }}
-          VERSION: ${{ inputs.version }}
+          DECLARED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          declared="${VERSION#v}"
+          declared="${DECLARED_VERSION#v}"
           manifest_version="$(jq -r '.version' "${SOURCE}/manifest.json")"
           if [ "${manifest_version}" != "${declared}" ]; then
             echo "::error::manifest.json declares ${manifest_version}, but this release is ${declared}."
@@ -130,7 +120,7 @@ jobs:
       - name: Pack the upload
         env:
           PACKAGE_ID: ${{ inputs.package-id }}
-          VERSION: ${{ inputs.version }}
+          DECLARED_VERSION: ${{ inputs.version }}
           BUILD: ${{ inputs.build }}
           CHANGELOG: ${{ inputs.changelog }}
         run: |
@@ -146,7 +136,7 @@ jobs:
           cp "${packages[0]}" "upload/${artifact}"
           jq -n \
             --arg packageId "${PACKAGE_ID}" \
-            --arg version "${VERSION#v}" \
+            --arg version "${DECLARED_VERSION#v}" \
             --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
             --arg artifactFileName "${artifact}" \
             --arg changelog "${CHANGELOG}" \
