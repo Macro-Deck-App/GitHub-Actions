@@ -1,0 +1,166 @@
+# The Macro Deck plugin publishing workflow.
+#
+# It is a *reusable* workflow rather than a composite action, and that distinction is the entire
+# security design. A composite action runs inside the caller's own job, so the OIDC token's
+# job_workflow_ref still names the creator's workflow and proves nothing about the build steps. A
+# reusable workflow invoked with `uses:` sets job_workflow_ref to this file, while `repository` and
+# `sha` still name the creator's repository and commit - which is exactly the pair the Platform
+# needs. The Platform's TrustedBuild:ApprovedJobWorkflowRefs allowlist names this file, at a `v*` tag,
+# and this file only.
+#
+# What it does: builds and packs the plugin with the Macro Deck plugin CLI, then uploads the package
+# to the Platform, where it lands in the Project's build library. A release is started from it in
+# the Creator Portal.
+
+name: Publish a Macro Deck plugin
+
+on:
+  workflow_call:
+    inputs:
+      package-id:
+        description: The reverse-DNS package identifier, as registered in the Creator Portal.
+        required: true
+        type: string
+      version:
+        description: >-
+          The version this build declares; one leading `v` is dropped, so a tag name can be passed
+          as-is. It must match the version in the plugin's manifest.json. A release started from the
+          build in the Creator Portal takes this number.
+        required: true
+        type: string
+      build:
+        description: >-
+          The build identifier, 1-64 letters, digits, `.`, `-`, `_` or `+`. Defaults to the run
+          number.
+        required: false
+        type: string
+        default: ''
+      source:
+        description: The plugin project directory, holding manifest.json and macrodeck-build.json.
+        required: true
+        type: string
+      changelog:
+        required: false
+        type: string
+        default: ''
+      cli-version:
+        description: The MacroDeck.Plugin.Cli version to build with. Defaults to the newest prerelease.
+        required: false
+        type: string
+        default: ''
+      platform-url:
+        required: false
+        type: string
+        default: https://api.macro-deck.app
+      audience:
+        description: >-
+          The audience the Platform expects in the OIDC token. Changing it means the Platform will
+          refuse the upload, which is the point: a token minted for somebody else is not a token
+          for us.
+        required: false
+        type: string
+        default: https://api.macro-deck.app
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The only permission that matters here. Without it the runner cannot mint an OIDC token and
+      # the upload has no credential at all - there is no fallback secret to fall back to.
+      id-token: write
+    steps:
+      # Pinned to the commit the workflow was called for rather than to a moving ref. The token
+      # attests to github.sha, so building anything else would make the attestation a false
+      # statement about the bytes.
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install the Macro Deck plugin CLI
+        env:
+          CLI_VERSION: ${{ inputs.cli-version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CLI_VERSION}" ]; then
+            dotnet tool install --global MacroDeck.Plugin.Cli --version "${CLI_VERSION}"
+          else
+            dotnet tool install --global MacroDeck.Plugin.Cli --prerelease
+          fi
+
+      # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
+      # which only `macrodeck-plugin build` assembles.
+      - name: Build and pack
+        env:
+          SOURCE: ${{ inputs.source }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          declared="${VERSION#v}"
+          manifest_version="$(jq -r '.version' "${SOURCE}/manifest.json")"
+          if [ "${manifest_version}" != "${declared}" ]; then
+            echo "::error::manifest.json declares ${manifest_version}, but this release is ${declared}."
+            exit 1
+          fi
+          macrodeck-plugin build --source "${SOURCE}" --output "${RUNNER_TEMP}/artifacts"
+
+      # build-metadata.json says which Project this upload is for, which version and build it is,
+      # and nothing else. Every provenance value - repository, commit, tag, run - is read from the
+      # OIDC token by the Platform, so writing them here would achieve nothing: they are ignored.
+      - name: Pack the upload
+        env:
+          PACKAGE_ID: ${{ inputs.package-id }}
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ inputs.build }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=("${RUNNER_TEMP}"/artifacts/*.macroDeckPlugin)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one .macroDeckPlugin, found ${#packages[@]}."
+            exit 1
+          fi
+          artifact="$(basename "${packages[0]}")"
+          mkdir -p upload
+          cp "${packages[0]}" "upload/${artifact}"
+          jq -n \
+            --arg packageId "${PACKAGE_ID}" \
+            --arg version "${VERSION#v}" \
+            --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
+            --arg artifactFileName "${artifact}" \
+            --arg changelog "${CHANGELOG}" \
+            '{schemaVersion: 1, packageId: $packageId, version: $version, build: $build,
+              artifactFileName: $artifactFileName, changelog: $changelog}' \
+            > upload/build-metadata.json
+          (cd upload && zip -q -r ../build.zip .)
+
+      # Requested as late as possible: the token is short-lived, and there is nothing to gain by
+      # holding one across a build that might take minutes.
+      - name: Request a build identity and upload
+        env:
+          AUDIENCE: ${{ inputs.audience }}
+          PLATFORM_URL: ${{ inputs.platform-url }}
+        run: |
+          set -euo pipefail
+          token="$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r '.value')"
+          if [ -z "${token}" ] || [ "${token}" = "null" ]; then
+            echo "::error::No OIDC token was issued. Does the job have id-token: write?"
+            exit 1
+          fi
+          # --fail-with-body so the Platform's own explanation reaches the run log. Its refusals are
+          # written to be read by whoever triggered the release.
+          curl -sS --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/zip" \
+            --data-binary @build.zip
