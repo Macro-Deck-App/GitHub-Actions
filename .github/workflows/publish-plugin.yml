@@ -96,6 +96,18 @@ jobs:
             dotnet tool install --global MacroDeck.Plugin.Cli --prerelease
           fi
 
+      # Restores every target the CLI will build before it runs. A first restore inside
+      # `macrodeck-plugin build` on a fresh runner has failed with no error logged, while the same
+      # build succeeds once the packages are cached; a failure here also shows its real error.
+      - name: Restore
+        env:
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          for rid in $(jq -r '.targets | keys[]' "${SOURCE}/macrodeck-build.json"); do
+            dotnet restore "${SOURCE}" -r "${rid}"
+          done
+
       # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
       # which only `macrodeck-plugin build` assembles.
       - name: Build and pack
