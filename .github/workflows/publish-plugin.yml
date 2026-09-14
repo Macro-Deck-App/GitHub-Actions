@@ -165,7 +165,9 @@ jobs:
           # --fail-with-body so the Platform's own explanation reaches the run log. Its refusals are
           # written to be read by whoever triggered the release. The progress meter stays on (no -s):
           # once it reaches 100% the time left is the Platform verifying and storing the build.
-          curl -S --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
+          # HTTP/1.1 because an HTTP/2 stream is capped by the proxy's flow-control window (64 KiB
+          # in Envoy), which limits a long-distance upload to about half a megabyte per second.
+          curl -S --http1.1 --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/zip" \
             --data-binary @build.zip \
