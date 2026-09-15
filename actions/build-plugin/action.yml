@@ -1,0 +1,61 @@
+name: Build a Macro Deck plugin
+description: >-
+  Checks the declared version against manifest.json, then builds and packs the plugin into a single
+  .macroDeckPlugin with `macrodeck-plugin build`. Needs the CLI, see setup-plugin-cli.
+
+inputs:
+  source:
+    description: The plugin project directory, holding manifest.json and macrodeck-build.json.
+    required: true
+  version:
+    description: >-
+      The version this build declares; one leading `v` is dropped. It must match the version in
+      manifest.json. Leave empty to skip the check.
+    required: false
+    default: ''
+  output-directory:
+    description: Where the package is written. Defaults to a directory under $RUNNER_TEMP.
+    required: false
+    default: ''
+
+outputs:
+  package-path:
+    description: The absolute path of the built .macroDeckPlugin.
+    value: ${{ steps.build.outputs.package-path }}
+  package-file-name:
+    description: The file name of the built .macroDeckPlugin.
+    value: ${{ steps.build.outputs.package-file-name }}
+
+runs:
+  using: composite
+  steps:
+    # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
+    # which only `macrodeck-plugin build` assembles.
+    - name: Build and pack
+      id: build
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        VERSION: ${{ inputs.version }}
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+      run: |
+        set -euo pipefail
+        if [ -n "${VERSION}" ]; then
+          declared="${VERSION#v}"
+          manifest_version="$(jq -r '.version' "${SOURCE}/manifest.json")"
+          if [ "${manifest_version}" != "${declared}" ]; then
+            echo "::error::manifest.json declares ${manifest_version}, but this release is ${declared}."
+            exit 1
+          fi
+        fi
+        output="${OUTPUT_DIRECTORY:-${RUNNER_TEMP}/macro-deck-plugin}"
+        macrodeck-plugin build --source "${SOURCE}" --output "${output}"
+        shopt -s nullglob
+        packages=("${output}"/*.macroDeckPlugin)
+        if [ "${#packages[@]}" -ne 1 ]; then
+          echo "::error::Expected exactly one .macroDeckPlugin, found ${#packages[@]}."
+          exit 1
+        fi
+        package="$(realpath "${packages[0]}")"
+        echo "package-path=${package}" >> "${GITHUB_OUTPUT}"
+        echo "package-file-name=$(basename "${package}")" >> "${GITHUB_OUTPUT}"

@@ -8,9 +8,15 @@
 # needs. The Platform's TrustedBuild:ApprovedJobWorkflowRefs allowlist names this file, at a `v*` tag,
 # and this file only.
 #
-# What it does: builds and packs the plugin with the Macro Deck plugin CLI, then uploads the package
-# to the Platform, where it lands in the Project's build library. A release is started from it in
-# the Creator Portal.
+# Setting up the CLI and building are the composite actions under actions/ in this repository, which
+# are useful on their own for builds that are not published. They are referenced by repository and
+# major tag, never by a local path: `./` would resolve against the caller's checkout, handing the
+# build steps to the very repository whose build this workflow is meant to vouch for. The upload
+# stays in this file: it is only ever accepted from here, so it has no use as an action.
+#
+# What it does: builds and packs the plugin with the Macro Deck plugin CLI, optionally keeps the
+# package as a workflow artifact, then uploads it to the Platform, where it lands in the Project's
+# build library. A release is started from it in the Creator Portal.
 
 name: Publish a Macro Deck plugin
 
@@ -48,6 +54,21 @@ on:
         required: false
         type: string
         default: ''
+      upload-artifact:
+        description: Also keep the built .macroDeckPlugin as a workflow artifact of the run.
+        required: false
+        type: boolean
+        default: false
+      artifact-name:
+        description: The workflow artifact's name. Defaults to the package file name.
+        required: false
+        type: string
+        default: ''
+      artifact-retention-days:
+        description: Days to keep the workflow artifact, 1-90. 0 uses the repository's default.
+        required: false
+        type: number
+        default: 0
       platform-url:
         required: false
         type: string
@@ -80,58 +101,43 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Set up .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Set up the Macro Deck plugin CLI
+        uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
         with:
-          dotnet-version: 10.0.x
+          cli-version: ${{ inputs.cli-version }}
 
-      - name: Install the Macro Deck plugin CLI
-        env:
-          CLI_VERSION: ${{ inputs.cli-version }}
-        run: |
-          set -euo pipefail
-          if [ -n "${CLI_VERSION}" ]; then
-            dotnet tool install --global MacroDeck.Plugin.Cli --version "${CLI_VERSION}"
-          else
-            dotnet tool install --global MacroDeck.Plugin.Cli --prerelease
-          fi
-
-      # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
-      # which only `macrodeck-plugin build` assembles.
       - name: Build and pack
-        env:
-          SOURCE: ${{ inputs.source }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          declared="${VERSION#v}"
-          manifest_version="$(jq -r '.version' "${SOURCE}/manifest.json")"
-          if [ "${manifest_version}" != "${declared}" ]; then
-            echo "::error::manifest.json declares ${manifest_version}, but this release is ${declared}."
-            exit 1
-          fi
-          macrodeck-plugin build --source "${SOURCE}" --output "${RUNNER_TEMP}/artifacts"
+        id: build
+        uses: Macro-Deck-App/GitHub-Actions/actions/build-plugin@v1
+        with:
+          source: ${{ inputs.source }}
+          version: ${{ inputs.version }}
+
+      # Before the Platform upload, so the package is kept even when the Platform refuses it.
+      - name: Keep the package as a workflow artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name || steps.build.outputs.package-file-name }}
+          path: ${{ steps.build.outputs.package-path }}
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. Every provenance value - repository, commit, tag, run - is read from the
       # OIDC token by the Platform, so writing them here would achieve nothing: they are ignored.
       - name: Pack the upload
         env:
+          PACKAGE_PATH: ${{ steps.build.outputs.package-path }}
           PACKAGE_ID: ${{ inputs.package-id }}
           VERSION: ${{ inputs.version }}
           BUILD: ${{ inputs.build }}
           CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          packages=("${RUNNER_TEMP}"/artifacts/*.macroDeckPlugin)
-          if [ "${#packages[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one .macroDeckPlugin, found ${#packages[@]}."
-            exit 1
-          fi
-          artifact="$(basename "${packages[0]}")"
-          mkdir -p upload
-          cp "${packages[0]}" "upload/${artifact}"
+          artifact="$(basename "${PACKAGE_PATH}")"
+          mkdir -p "${RUNNER_TEMP}/upload"
+          cp "${PACKAGE_PATH}" "${RUNNER_TEMP}/upload/${artifact}"
           jq -n \
             --arg packageId "${PACKAGE_ID}" \
             --arg version "${VERSION#v}" \
@@ -140,8 +146,8 @@ jobs:
             --arg changelog "${CHANGELOG}" \
             '{schemaVersion: 1, packageId: $packageId, version: $version, build: $build,
               artifactFileName: $artifactFileName, changelog: $changelog}' \
-            > upload/build-metadata.json
-          (cd upload && zip -q -r ../build.zip .)
+            > "${RUNNER_TEMP}/upload/build-metadata.json"
+          (cd "${RUNNER_TEMP}/upload" && zip -q -r ../build.zip .)
 
       # Requested as late as possible: the token is short-lived, and there is nothing to gain by
       # holding one across a build that might take minutes.
@@ -163,4 +169,4 @@ jobs:
           curl -sS --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/zip" \
-            --data-binary @build.zip
+            --data-binary @"${RUNNER_TEMP}/build.zip"

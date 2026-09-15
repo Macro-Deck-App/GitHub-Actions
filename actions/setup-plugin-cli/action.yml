@@ -1,0 +1,32 @@
+name: Set up the Macro Deck plugin CLI
+description: Installs .NET and the MacroDeck.Plugin.Cli global tool, which provides `macrodeck-plugin`.
+
+inputs:
+  cli-version:
+    description: The MacroDeck.Plugin.Cli version to install. Defaults to the newest prerelease.
+    required: false
+    default: ''
+  dotnet-version:
+    description: The .NET SDK version to set up.
+    required: false
+    default: 10.0.x
+
+runs:
+  using: composite
+  steps:
+    - name: Set up .NET
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+
+    - name: Install the Macro Deck plugin CLI
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -euo pipefail
+        if [ -n "${CLI_VERSION}" ]; then
+          dotnet tool install --global MacroDeck.Plugin.Cli --version "${CLI_VERSION}"
+        else
+          dotnet tool install --global MacroDeck.Plugin.Cli --prerelease
+        fi
