@@ -295,12 +295,40 @@ jobs:
             exit 1
           fi
           echo "Uploading $(du -h "${RUNNER_TEMP}/build.zip" | cut -f1) to ${PLATFORM_URL%/}/api/v1/builds..."
-          # --fail-with-body so the Platform's own explanation reaches the run log. Its refusals are
-          # written to be read by whoever triggered the release. The progress meter stays on (no -s):
-          # once it reaches 100% the time left is the Platform verifying and storing the build.
-          # HTTP/1.1 because an HTTP/2 stream is capped by the proxy's flow-control window (64 KiB
-          # in Envoy), which limits a long-distance upload to about half a megabyte per second.
-          curl -S --http1.1 --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
+          # The progress meter stays on (no -s): once it reaches 100% the time left is the Platform
+          # verifying and storing the build. HTTP/1.1 because an HTTP/2 stream is capped by the proxy's
+          # flow-control window (64 KiB in Envoy), which limits a long-distance upload to about half a
+          # megabyte per second.
+          response="${RUNNER_TEMP}/upload-response.json"
+          if ! status="$(curl -S --http1.1 -o "${response}" -w '%{http_code}' -X POST "${PLATFORM_URL%/}/api/v1/builds" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/zip" \
-            --data-binary @"${RUNNER_TEMP}/build.zip"
+            --data-binary @"${RUNNER_TEMP}/build.zip")"; then
+            echo "::error title=Upload failed::The build could not be sent to ${PLATFORM_URL%/}. See the log above."
+            exit 1
+          fi
+
+          if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+            echo "The Macro Deck Platform accepted the build (HTTP ${status})."
+            exit 0
+          fi
+
+          # A refusal is written to be read by whoever triggered the release: its title and detail become
+          # the run's error annotation and job summary, and the run fails.
+          title="$(jq -r '.title // empty' "${response}" 2>/dev/null || true)"
+          detail="$(jq -r '.detail // empty' "${response}" 2>/dev/null || true)"
+          [ -n "${title}" ] || title="The Macro Deck Platform refused the build (HTTP ${status})."
+          [ -n "${detail}" ] || detail="$(head -c 2000 "${response}" 2>/dev/null || true)"
+          escape_data() { local value="${1//%/%25}"; value="${value//$'\r'/%0D}"; printf '%s' "${value//$'\n'/%0A}"; }
+          escape_property() { local value; value="$(escape_data "$1")"; value="${value//:/%3A}"; printf '%s' "${value//,/%2C}"; }
+          echo "::error title=$(escape_property "${title}")::$(escape_data "${detail:-${title}}")"
+          {
+            echo "### The Macro Deck Platform refused this build"
+            echo
+            echo "**${title}**"
+            echo
+            [ -z "${detail}" ] || echo "${detail}"
+            echo
+            echo "HTTP ${status}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 1
