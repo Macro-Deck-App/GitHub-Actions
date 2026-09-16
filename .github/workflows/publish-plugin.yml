@@ -30,8 +30,9 @@ on:
       version:
         description: >-
           The version this build declares; one leading `v` is dropped, so a tag name can be passed
-          as-is. It must match the version in the plugin's manifest.json. A release started from the
-          build in the Creator Portal takes this number.
+          as-is. It is written into the plugin's manifest.json and set as the assembly version, so
+          the version in the repository does not matter. A release started from the build in the
+          Creator Portal takes this number.
         required: true
         type: string
       build:
@@ -130,7 +131,7 @@ jobs:
         env:
           PACKAGE_PATH: ${{ steps.build.outputs.package-path }}
           PACKAGE_ID: ${{ inputs.package-id }}
-          VERSION: ${{ inputs.version }}
+          DECLARED_VERSION: ${{ inputs.version }}
           BUILD: ${{ inputs.build }}
           CHANGELOG: ${{ inputs.changelog }}
         run: |
@@ -140,7 +141,7 @@ jobs:
           cp "${PACKAGE_PATH}" "${RUNNER_TEMP}/upload/${artifact}"
           jq -n \
             --arg packageId "${PACKAGE_ID}" \
-            --arg version "${VERSION#v}" \
+            --arg version "${DECLARED_VERSION#v}" \
             --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
             --arg artifactFileName "${artifact}" \
             --arg changelog "${CHANGELOG}" \
@@ -157,6 +158,7 @@ jobs:
           PLATFORM_URL: ${{ inputs.platform-url }}
         run: |
           set -euo pipefail
+          echo "Requesting a GitHub Actions OIDC token for ${AUDIENCE}..."
           token="$(curl -sSf \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r '.value')"
@@ -164,9 +166,13 @@ jobs:
             echo "::error::No OIDC token was issued. Does the job have id-token: write?"
             exit 1
           fi
+          echo "Uploading $(du -h "${RUNNER_TEMP}/build.zip" | cut -f1) to ${PLATFORM_URL%/}/api/v1/builds..."
           # --fail-with-body so the Platform's own explanation reaches the run log. Its refusals are
-          # written to be read by whoever triggered the release.
-          curl -sS --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
+          # written to be read by whoever triggered the release. The progress meter stays on (no -s):
+          # once it reaches 100% the time left is the Platform verifying and storing the build.
+          # HTTP/1.1 because an HTTP/2 stream is capped by the proxy's flow-control window (64 KiB
+          # in Envoy), which limits a long-distance upload to about half a megabyte per second.
+          curl -S --http1.1 --fail-with-body -X POST "${PLATFORM_URL%/}/api/v1/builds" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/zip" \
             --data-binary @"${RUNNER_TEMP}/build.zip"
