@@ -46,6 +46,80 @@ project's build library in the Creator Portal, where a release is started from i
   the plugin's `manifest.json` and builds with it as the assembly version. The build number
   defaults to the run number.
 
+## Dependency list
+
+After building, the workflow lists the NuGet packages the plugin project restored and uploads them
+with the build as `dependencies.json`. The Creator Portal shows them per build, on the version started
+from it and to the moderator reviewing it, and the Platform's security scan reads them. Nothing has to
+be configured.
+
+It is optional and never fails a release: if the project cannot be found or listed, the file is left
+out with a warning and the build is uploaded without it.
+
+- **The project** is the one `macrodeck-build.json` publishes (the first `*.csproj`, `*.fsproj` or
+  `*.vbproj` argument of a `dotnet` target), or else the only project file in `source`.
+- **Packages** come from `dotnet list package --include-transitive --format json`, per target
+  framework, so central package management and multi-targeting are covered.
+- **Vulnerabilities** come from a second call with `--vulnerable`, which needs the feeds' vulnerability
+  data (nuget.org's). If that call fails, the list is uploaded with `vulnerabilitiesChecked: false`. A
+  feed that publishes no vulnerability data reports none.
+- **Feeds** are the configured restore sources (`project.restore.sources` of the assets file). Each
+  package's own feed is read from the `.nupkg.metadata` NuGet writes into the packages folder. A folder
+  inside the checkout is written relative to it (`./local-feed`); a URL loses any credentials and query
+  string. No secret reaches the file.
+- **Limits.** The Platform refuses a list over 1 MiB or with more than 5,000 package references, so the
+  workflow leaves such a list out rather than fail the upload.
+
+```json
+{
+  "schemaVersion": 1,
+  "generatedBy": "Macro-Deck-App/GitHub-Actions publish-plugin.yml",
+  "sdkVersion": "10.0.101",
+  "vulnerabilitiesChecked": true,
+  "sources": ["./local-feed", "https://api.nuget.org/v3/index.json"],
+  "frameworks": [
+    {
+      "framework": "net10.0",
+      "packages": [
+        {
+          "id": "Newtonsoft.Json",
+          "requestedVersion": "12.0.1",
+          "resolvedVersion": "12.0.1",
+          "direct": true,
+          "source": "https://api.nuget.org/v3/index.json",
+          "vulnerabilities": [
+            { "severity": "High", "advisoryUrl": "https://github.com/advisories/GHSA-5crp-9r3c-p9vr" }
+          ]
+        },
+        {
+          "id": "Microsoft.Extensions.Logging.Abstractions",
+          "resolvedVersion": "8.0.0",
+          "direct": false,
+          "source": "https://api.nuget.org/v3/index.json",
+          "vulnerabilities": []
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | `1`. A breaking change to the format gets a new number |
+| `generatedBy`, `sdkVersion` | Which workflow and .NET SDK wrote it |
+| `vulnerabilitiesChecked` | Whether the vulnerability check ran |
+| `sources` | The configured restore feeds |
+| `frameworks[].framework` | A target framework of the project |
+| `packages[].id`, `resolvedVersion` | The package and the version restore resolved |
+| `packages[].requestedVersion` | What the project asked for; direct dependencies only |
+| `packages[].direct` | Referenced by the project itself rather than by another package |
+| `packages[].source` | The feed it came from: a URL, `./path` inside the repository, or an absolute path. Omitted when unknown |
+| `packages[].vulnerabilities` | `severity` (`Low`, `Moderate`, `High`, `Critical`) and `advisoryUrl` |
+
+The list is trusted exactly as much as the build: it is written by this workflow, in the same job
+the plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bill of materials.
+
 ## Inputs
 
 | Input | Required | Description |

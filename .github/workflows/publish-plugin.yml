@@ -124,6 +124,134 @@ jobs:
           retention-days: ${{ inputs.artifact-retention-days }}
           if-no-files-found: error
 
+      # Optional. The NuGet packages the build restored, for the moderator and the security scan: each
+      # package with its resolved version, whether the project references it directly, the feed it
+      # came from and any known vulnerability. Nothing here can fail the release - on any problem the
+      # file is left out with a warning and the upload goes ahead without it. The schema is in the
+      # README. The Platform refuses a file that breaks it, so this step keeps within its limits
+      # (1 MiB, 5,000 packages) rather than send one that would fail the upload.
+      - name: List the dependencies
+        continue-on-error: true
+        env:
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -uo pipefail
+          work="${RUNNER_TEMP}/dependencies"
+          rm -rf "${work}"
+          mkdir -p "${work}" "${RUNNER_TEMP}/upload"
+          rm -f "${RUNNER_TEMP}/upload/dependencies.json"
+          skip() {
+            echo "::warning::The build is uploaded without a dependency list: $1"
+            exit 0
+          }
+
+          # The project macrodeck-build.json publishes, or else the only project file beside it.
+          project=""
+          if [ -f "${SOURCE}/macrodeck-build.json" ]; then
+            project="$(jq -r '[.targets[]? | select(.executable == "dotnet") | .arguments[]?
+              | strings | select(test("\\.(cs|fs|vb)proj$"))] | first // empty' \
+              "${SOURCE}/macrodeck-build.json" 2>/dev/null)" || project=""
+          fi
+          if [ -z "${project}" ]; then
+            shopt -s nullglob
+            candidates=("${SOURCE}"/*.csproj "${SOURCE}"/*.fsproj "${SOURCE}"/*.vbproj)
+            shopt -u nullglob
+            [ "${#candidates[@]}" -eq 1 ] || skip "no single project file was found in ${SOURCE}."
+            project="$(basename "${candidates[0]}")"
+          fi
+          case "${project}" in
+            /*) project_path="${project}" ;;
+            *) project_path="${SOURCE}/${project}" ;;
+          esac
+          [ -f "${project_path}" ] || skip "${project_path} does not exist."
+
+          assets="$(dotnet msbuild "${project_path}" -getProperty:ProjectAssetsFile 2>/dev/null | tail -n 1)" || assets=""
+          if [ -z "${assets}" ] || [ ! -f "${assets}" ]; then
+            dotnet restore "${project_path}" > "${work}/restore.log" 2>&1 || skip "the project could not be restored."
+            assets="$(dirname "${project_path}")/obj/project.assets.json"
+          fi
+          [ -f "${assets}" ] || skip "the project's assets file was not found."
+
+          dotnet list "${project_path}" package --include-transitive --format json \
+            > "${work}/packages.json" 2> "${work}/packages.log" \
+            || skip "dotnet list package failed."
+
+          # Needs the feeds' vulnerability data (nuget.org's). If it cannot be reached, only this part
+          # is lost, and the list says it was not checked.
+          checked=true
+          if ! dotnet list "${project_path}" package --vulnerable --include-transitive --format json \
+            > "${work}/vulnerable.json" 2> "${work}/vulnerable.log" \
+            || ! jq -e '.version == 1' "${work}/vulnerable.json" > /dev/null 2>&1; then
+            echo "::warning::Known vulnerabilities could not be checked; the dependency list says so."
+            checked=false
+            echo '{}' > "${work}/vulnerable.json"
+          fi
+
+          # Which feed each package came from, from the .nupkg.metadata NuGet writes beside it in the
+          # packages folder. The first folder holding a package wins; one without metadata has no source.
+          jq -r '(.packageFolders // {} | keys[]) as $folder | .libraries // {} | to_entries[]
+            | select(.value.type == "package")
+            | [(.key | ascii_downcase), "\($folder | rtrimstr("/"))/\(.value.path)/.nupkg.metadata"] | @tsv' \
+            "${assets}" > "${work}/libraries.tsv" || skip "the assets file could not be read."
+          while IFS=$'\t' read -r key metadata; do
+            [ -f "${metadata}" ] || continue
+            feed="$(jq -r '.source // empty' "${metadata}" 2>/dev/null)" || continue
+            [ -n "${feed}" ] && printf '%s\t%s\n' "${key}" "${feed}"
+          done < "${work}/libraries.tsv" > "${work}/resolved.tsv"
+          jq -Rn '[inputs | split("\t") | {key: .[0], value: .[1]}] | reverse | from_entries' \
+            "${work}/resolved.tsv" > "${work}/resolved.json" || skip "the package feeds could not be read."
+
+          jq -n \
+            --slurpfile packages "${work}/packages.json" \
+            --slurpfile vulnerable "${work}/vulnerable.json" \
+            --slurpfile assets "${assets}" \
+            --slurpfile resolved "${work}/resolved.json" \
+            --argjson checked "${checked}" \
+            --arg workspace "${GITHUB_WORKSPACE%/}" \
+            --arg sdk "$(dotnet --version)" \
+            '
+            # A feed inside the checkout is written relative to it (./local-feed), so the Platform can
+            # tell a committed feed from one on the runner. Credentials and query strings are dropped.
+            def feed:
+              sub("/+$"; "")
+              | if $workspace != "" and startswith($workspace + "/") then "./" + ltrimstr($workspace + "/")
+                elif test("^https?://"; "i") then sub("^(?<scheme>[A-Za-z]+://)[^/@]*@"; "\(.scheme)") | sub("[?#].*$"; "")
+                else . end;
+            ($vulnerable[0].projects[0].frameworks // [] | map(.framework as $framework
+              | ((.topLevelPackages // []) + (.transitivePackages // []))[]
+              | {key: "\($framework)|\(.id | ascii_downcase)",
+                 value: [.vulnerabilities[]? | {severity, advisoryUrl: .advisoryurl}]})
+              | from_entries) as $advisories
+            | {
+                schemaVersion: 1,
+                generatedBy: "Macro-Deck-App/GitHub-Actions publish-plugin.yml",
+                sdkVersion: $sdk,
+                vulnerabilitiesChecked: $checked,
+                sources: [$assets[0].project.restore.sources // {} | keys[] | feed] | unique,
+                frameworks: [$packages[0].projects[0].frameworks[]? | .framework as $framework | {
+                  framework: $framework,
+                  packages: [
+                    ((.topLevelPackages // [])[] | . + {direct: true}),
+                    ((.transitivePackages // [])[] | . + {direct: false})
+                    | select(.resolvedVersion != null)
+                    | {id, requestedVersion, resolvedVersion, direct,
+                       source: ($resolved[0]["\(.id | ascii_downcase)/\(.resolvedVersion | ascii_downcase)"]
+                         | if . == null then null else feed end),
+                       vulnerabilities: ($advisories["\($framework)|\(.id | ascii_downcase)"] // [])}
+                    | with_entries(select(.value != null))
+                  ]
+                }]
+              }
+            ' > "${work}/dependencies.json" || skip "the dependency list could not be assembled."
+
+          count="$(jq '[.frameworks[].packages | length] | add // 0' "${work}/dependencies.json")" \
+            || skip "the dependency list could not be read back."
+          size="$(wc -c < "${work}/dependencies.json" | tr -d ' ')"
+          [ "${count}" -le 5000 ] || skip "${count} packages is more than the 5,000 the Platform accepts."
+          [ "${size}" -le 1048576 ] || skip "the list is larger than the 1 MiB the Platform accepts."
+          mv "${work}/dependencies.json" "${RUNNER_TEMP}/upload/dependencies.json"
+          echo "Listed ${count} package references for $(jq -r '[.frameworks[].framework] | join(", ")' "${RUNNER_TEMP}/upload/dependencies.json")."
+
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. Every provenance value - repository, commit, tag, run - is read from the
       # OIDC token by the Platform, so writing them here would achieve nothing: they are ignored.
