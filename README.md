@@ -92,8 +92,6 @@ compiled per platform - needs `build-per-platform`:
       version: ${{ github.event.release.tag_name }}
       source: src/MyPlugin
       build-per-platform: true
-      # The merge command is in 3.0.0-beta.11 and newer.
-      cli-version: 3.0.0-beta.11
 ```
 
 `build` then becomes one job per runtime identifier the manifest declares, each building only its own
@@ -197,7 +195,7 @@ plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bi
 | `run-tests` | no | Runs the repository's tests after the build. Defaults to `true`. |
 | `test-path` | no | The solution, project or directory `dotnet test` runs; defaults to the only solution at the repository root. |
 | `run-stub-host` | no | Runs the conformance suite on a stub host before the upload. Defaults to `true`. |
-| `cli-version` | no | `MacroDeck.Plugin.Cli` version; defaults to the newest prerelease. |
+| `cli-version` | no | `MacroDeck.Plugin.Cli` version; defaults to the newest release carrying every command these actions use (`3.0.0-beta.11`). |
 | `upload-artifact` | no | `true` also keeps the `.macroDeckPlugin` as a workflow artifact. Defaults to `false`. |
 | `artifact-name` | no | The artifact's name; defaults to the package file name. |
 | `artifact-retention-days` | no | Days to keep the artifact (1-90); `0`, the default, uses the repository setting. |
@@ -225,7 +223,7 @@ steps:
 
 | Action | Inputs | Outputs |
 | --- | --- | --- |
-| `setup-plugin-cli` | `cli-version`, `dotnet-version` (default `10.0.x`) | |
+| `setup-plugin-cli` | `cli-version` (defaults to `3.0.0-beta.11`), `dotnet-version` (default `10.0.x`) | |
 | `build-plugin` | `source` (required), `version` (written into `manifest.json` when set), `rid` (build only that runtime identifier), `output-directory` | `package-path`, `package-file-name` |
 
 There is no upload action: the Platform accepts builds only from `publish-plugin.yml`, so

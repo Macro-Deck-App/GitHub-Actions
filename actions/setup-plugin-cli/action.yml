@@ -3,7 +3,9 @@ description: Installs .NET and the MacroDeck.Plugin.Cli global tool, which provi
 
 inputs:
   cli-version:
-    description: The MacroDeck.Plugin.Cli version to install. Defaults to the newest prerelease.
+    description: >-
+      The MacroDeck.Plugin.Cli version to install. Defaults to the newest release that carries every
+      command this repository's actions use.
     required: false
     default: ''
   dotnet-version:
@@ -19,14 +21,13 @@ runs:
       with:
         dotnet-version: ${{ inputs.dotnet-version }}
 
+    # Pinned rather than --prerelease, which resolves to 3.0.0-preview.10: SemVer orders `beta` before
+    # `preview`, so the newest published release is not the one --prerelease picks, and preview.10 has
+    # no `merge` command. Raise this when the CLI's prerelease labels are back in order.
     - name: Install the Macro Deck plugin CLI
       shell: bash
       env:
-        CLI_VERSION: ${{ inputs.cli-version }}
+        CLI_VERSION: ${{ inputs.cli-version || '3.0.0-beta.11' }}
       run: |
         set -euo pipefail
-        if [ -n "${CLI_VERSION}" ]; then
-          dotnet tool install --global MacroDeck.Plugin.Cli --version "${CLI_VERSION}"
-        else
-          dotnet tool install --global MacroDeck.Plugin.Cli --prerelease
-        fi
+        dotnet tool install --global MacroDeck.Plugin.Cli --version "${CLI_VERSION}"
