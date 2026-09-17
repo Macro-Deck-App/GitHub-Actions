@@ -14,6 +14,14 @@ inputs:
       does not matter. Leave empty to build the manifest's own version.
     required: false
     default: ''
+  rid:
+    description: >-
+      Build only this runtime identifier, which the manifest must declare, and name the package
+      <id>-<version>-<rid>.macroDeckPlugin. Leave empty to build every runtime identifier the
+      manifest declares. Packages built this way on several runners are combined with
+      `macrodeck-plugin merge`.
+    required: false
+    default: ''
   output-directory:
     description: Where the package is written. Defaults to a directory under $RUNNER_TEMP.
     required: false
@@ -41,18 +49,23 @@ runs:
       env:
         SOURCE: ${{ inputs.source }}
         DECLARED_VERSION: ${{ inputs.version }}
+        RID: ${{ inputs.rid }}
         OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
       run: |
         set -euo pipefail
         output="${OUTPUT_DIRECTORY:-${RUNNER_TEMP}/macro-deck-plugin}"
         declared="${DECLARED_VERSION#v}"
+        arguments=(build --source "${SOURCE}" --output "${output}")
+        if [ -n "${RID}" ]; then
+          arguments+=(--rid "${RID}")
+        fi
         if [ -n "${declared}" ]; then
           jq --arg version "${declared}" '.version = $version' "${SOURCE}/manifest.json" \
             > "${RUNNER_TEMP}/manifest.json"
           mv "${RUNNER_TEMP}/manifest.json" "${SOURCE}/manifest.json"
-          Version="${declared}" macrodeck-plugin build --source "${SOURCE}" --output "${output}"
+          Version="${declared}" macrodeck-plugin "${arguments[@]}"
         else
-          macrodeck-plugin build --source "${SOURCE}" --output "${output}"
+          macrodeck-plugin "${arguments[@]}"
         fi
         shopt -s nullglob
         packages=("${output}"/*.macroDeckPlugin)

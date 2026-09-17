@@ -49,11 +49,13 @@ project's build library in the Creator Portal, where a release is started from i
 
 ## How a publish runs
 
-The workflow runs three jobs, in this order:
+The workflow runs these jobs, in this order:
 
 | Job | Runner | Permissions | What it does |
 | --- | --- | --- | --- |
-| `build` | `ubuntu-latest` | `contents: read` | Builds the `.macroDeckPlugin`, runs the repository's tests, lists the dependencies |
+| `plan` | `ubuntu-latest` | `contents: read` | Reads the manifest's entrypoints and decides which platforms are built, on which runners |
+| `build` | `ubuntu-latest`, or one per platform | `contents: read` | Builds the `.macroDeckPlugin`, runs the repository's tests, lists the dependencies |
+| `package` | `ubuntu-latest` | none | Only with `build-per-platform`: merges the platform packages into one |
 | `stub-host` | one the manifest declares | none | Runs the plugin conformance suite against the package on a disposable stub host |
 | `upload` | `ubuntu-latest` | `id-token: write` | Packs `build-metadata.json` and uploads the build to the Platform |
 
@@ -63,7 +65,8 @@ The workflow runs three jobs, in this order:
   job handed over.
 - **The package cannot change on the way.** Its SHA-256 is recorded right after the build, checked
   before the build job hands it over (so the tests cannot have swapped it) and checked again by each
-  job that receives it.
+  job that receives it - including `package`, which checks every platform package before merging them
+  and records the digest of the merged one.
 - **Tests.** `dotnet test -c Release` on `test-path`, or on the repository's only solution (`*.sln`,
   `*.slnx`) at its root. With none or several, the step is skipped with a warning. A failing test
   stops the release.
@@ -72,11 +75,40 @@ The workflow runs three jobs, in this order:
   full report is the job's summary; only a failed required check stops the release. The plugin runs
   on its own platform, so the job picks the first runner the manifest declares an entrypoint for:
   `linux-x64` (`ubuntu-latest`), `win-x64` (`windows-latest`), `osx-arm64` (`macos-latest`),
-  `linux-arm64` (`ubuntu-24.04-arm`), `win-arm64` (`windows-11-arm`). A plugin declaring none of them
-  is not run, with a warning.
+  `linux-arm64` (`ubuntu-24.04-arm`), `win-arm64` (`windows-11-arm`), `osx-x64` (`macos-15-intel`). A
+  plugin declaring none of them is not run, with a warning.
 
 The calling job still grants `id-token: write`, as in the example above: a reusable workflow's jobs
 can only narrow the caller's permissions, not add to them.
+
+## Building each platform on its own runner
+
+One Linux runner cross-builds every platform a plain .NET plugin declares, which is the default and
+needs nothing. A target that only builds natively - a `net10.0-windows` target, or a native library
+compiled per platform - needs `build-per-platform`:
+
+```yaml
+    with:
+      version: ${{ github.event.release.tag_name }}
+      source: src/MyPlugin
+      build-per-platform: true
+      # The merge command is in 3.0.0-beta.11 and newer.
+      cli-version: 3.0.0-beta.11
+```
+
+`build` then becomes one job per runtime identifier the manifest declares, each building only its own
+with [`macrodeck-plugin build --rid`](https://docs.macro-deck.app/cli/build/), and `package` combines
+them with [`macrodeck-plugin merge`](https://docs.macro-deck.app/cli/merge/) into the single package
+that is uploaded - the one a build on a machine that could build every platform would have produced.
+Merging refuses packages that do not belong together: a different plugin or version, a manifest that
+differs beyond its `entrypoints`, a runtime identifier twice, or a shared file whose bytes differ.
+
+- The tests and the dependency list run once, on the first platform (Linux when the manifest declares
+  it): they are about the repository, not about a runner.
+- `upload-artifact` keeps the merged package, not the platform ones.
+- The runner per platform is the same table the stub host uses. Override it, or name one for a
+  platform not in it, with `runners`: `runners: '{"osx-arm64": "macos-15"}'`.
+- One platform failing does not cancel the others, so a run shows every platform that is broken.
 
 ## Dependency list
 
@@ -158,6 +190,8 @@ plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bi
 | --- | --- | --- |
 | `version` | yes | The version the build declares; a leading `v` is dropped. Written into `manifest.json`. |
 | `source` | yes | The plugin project directory, holding `manifest.json` and `macrodeck-build.json`. |
+| `build-per-platform` | no | Builds each declared runtime identifier on a runner of its own platform and merges the results. Defaults to `false`. |
+| `runners` | no | JSON object naming the runner that builds a runtime identifier, merged over the defaults. Defaults to `{}`. |
 | `build` | no | Build identifier; defaults to the run number. |
 | `changelog` | no | Becomes the default changelog of a release started from the build. |
 | `run-tests` | no | Runs the repository's tests after the build. Defaults to `true`. |
@@ -192,7 +226,7 @@ steps:
 | Action | Inputs | Outputs |
 | --- | --- | --- |
 | `setup-plugin-cli` | `cli-version`, `dotnet-version` (default `10.0.x`) | |
-| `build-plugin` | `source` (required), `version` (written into `manifest.json` when set), `output-directory` | `package-path`, `package-file-name` |
+| `build-plugin` | `source` (required), `version` (written into `manifest.json` when set), `rid` (build only that runtime identifier), `output-directory` | `package-path`, `package-file-name` |
 
 There is no upload action: the Platform accepts builds only from `publish-plugin.yml`, so
 publishing always goes through the reusable workflow.
