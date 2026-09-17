@@ -4,7 +4,7 @@ Reusable workflows and actions for publishing to the Macro Deck Store.
 
 | Workflow / action | Purpose |
 | --- | --- |
-| [`publish-plugin.yml`](.github/workflows/publish-plugin.yml) | Builds and packs a plugin with the Macro Deck plugin CLI and uploads it to the Platform's build library |
+| [`publish-plugin.yml`](.github/workflows/publish-plugin.yml) | Builds a plugin with the Macro Deck plugin CLI, tests it, runs it on a stub host and uploads it to the Platform's build library |
 | [`actions/setup-plugin-cli`](actions/setup-plugin-cli/action.yml) | Installs .NET and the `MacroDeck.Plugin.Cli` tool |
 | [`actions/build-plugin`](actions/build-plugin/action.yml) | Writes the version into `manifest.json` and builds a `.macroDeckPlugin` |
 
@@ -46,6 +46,37 @@ project's build library in the Creator Portal, where a release is started from i
 - The release's tag is the version (one leading `v` is dropped): the workflow writes it into
   the plugin's `manifest.json` and builds with it as the assembly version. The build number
   defaults to the run number.
+
+## How a publish runs
+
+The workflow runs three jobs, in this order:
+
+| Job | Runner | Permissions | What it does |
+| --- | --- | --- | --- |
+| `build` | `ubuntu-latest` | `contents: read` | Builds the `.macroDeckPlugin`, runs the repository's tests, lists the dependencies |
+| `stub-host` | one the manifest declares | none | Runs the plugin conformance suite against the package on a disposable stub host |
+| `upload` | `ubuntu-latest` | `id-token: write` | Packs `build-metadata.json` and uploads the build to the Platform |
+
+- **Only the upload job can authenticate.** Every step of a job with `id-token: write` can request
+  the OIDC token the Platform accepts, including build scripts, MSBuild targets and tests. So nothing
+  from the repository runs in that job: it checks nothing out and only uploads the package the build
+  job handed over.
+- **The package cannot change on the way.** Its SHA-256 is recorded right after the build, checked
+  before the build job hands it over (so the tests cannot have swapped it) and checked again by each
+  job that receives it.
+- **Tests.** `dotnet test -c Release` on `test-path`, or on the repository's only solution (`*.sln`,
+  `*.slnx`) at its root. With none or several, the step is skipped with a warning. A failing test
+  stops the release.
+- **Stub host.** `macrodeck-plugin test --artifact` starts the package the way Macro Deck does and
+  checks registration, protocol negotiation, capabilities, timeouts, disconnect and reconnect. The
+  full report is the job's summary; only a failed required check stops the release. The plugin runs
+  on its own platform, so the job picks the first runner the manifest declares an entrypoint for:
+  `linux-x64` (`ubuntu-latest`), `win-x64` (`windows-latest`), `osx-arm64` (`macos-latest`),
+  `linux-arm64` (`ubuntu-24.04-arm`), `win-arm64` (`windows-11-arm`). A plugin declaring none of them
+  is not run, with a warning.
+
+The calling job still grants `id-token: write`, as in the example above: a reusable workflow's jobs
+can only narrow the caller's permissions, not add to them.
 
 ## Dependency list
 
@@ -118,8 +149,8 @@ out with a warning and the build is uploaded without it.
 | `packages[].source` | The feed it came from: a URL, `./path` inside the repository, or an absolute path. Omitted when unknown |
 | `packages[].vulnerabilities` | `severity` (`Low`, `Moderate`, `High`, `Critical`) and `advisoryUrl` |
 
-The list is trusted exactly as much as the build: it is written by this workflow, in the same job
-the plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bill of materials.
+The list is trusted exactly as much as the build: it is written by this workflow, in the job the
+plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bill of materials.
 
 ## Inputs
 
@@ -129,6 +160,9 @@ the plugin's own MSBuild code runs in. It helps a moderator; it is not a verifie
 | `source` | yes | The plugin project directory, holding `manifest.json` and `macrodeck-build.json`. |
 | `build` | no | Build identifier; defaults to the run number. |
 | `changelog` | no | Becomes the default changelog of a release started from the build. |
+| `run-tests` | no | Runs the repository's tests after the build. Defaults to `true`. |
+| `test-path` | no | The solution, project or directory `dotnet test` runs; defaults to the only solution at the repository root. |
+| `run-stub-host` | no | Runs the conformance suite on a stub host before the upload. Defaults to `true`. |
 | `cli-version` | no | `MacroDeck.Plugin.Cli` version; defaults to the newest prerelease. |
 | `upload-artifact` | no | `true` also keeps the `.macroDeckPlugin` as a workflow artifact. Defaults to `false`. |
 | `artifact-name` | no | The artifact's name; defaults to the package file name. |
