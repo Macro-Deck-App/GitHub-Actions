@@ -26,7 +26,6 @@ jobs:
       contents: read
       id-token: write
     with:
-      package-id: com.example.my-plugin
       version: ${{ github.event.release.tag_name }}
       source: src/MyPlugin
       changelog: ${{ github.event.release.body }}
@@ -42,6 +41,8 @@ project's build library in the Creator Portal, where a release is started from i
 - No secret is involved. The job authenticates with a GitHub Actions OIDC token; the
   Platform reads repository, commit, tag and run from it and accepts it only from this
   workflow at a `v*` tag, and only for the repository connected to the project.
+- The package identifier is the `id` in `manifest.json`; it has to match the package
+  registered in the Creator Portal.
 - The release's tag is the version (one leading `v` is dropped): the workflow writes it into
   the plugin's `manifest.json` and builds with it as the assembly version. The build number
   defaults to the run number.
@@ -124,7 +125,6 @@ the plugin's own MSBuild code runs in. It helps a moderator; it is not a verifie
 
 | Input | Required | Description |
 | --- | --- | --- |
-| `package-id` | yes | The package identifier registered in the Creator Portal. |
 | `version` | yes | The version the build declares; a leading `v` is dropped. Written into `manifest.json`. |
 | `source` | yes | The plugin project directory, holding `manifest.json` and `macrodeck-build.json`. |
 | `build` | no | Build identifier; defaults to the run number. |

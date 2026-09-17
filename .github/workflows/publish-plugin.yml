@@ -23,10 +23,6 @@ name: Publish a Macro Deck plugin
 on:
   workflow_call:
     inputs:
-      package-id:
-        description: The reverse-DNS package identifier, as registered in the Creator Portal.
-        required: true
-        type: string
       version:
         description: >-
           The version this build declares; one leading `v` is dropped, so a tag name can be passed
@@ -253,22 +249,30 @@ jobs:
           echo "Listed ${count} package references for $(jq -r '[.frameworks[].framework] | join(", ")' "${RUNNER_TEMP}/upload/dependencies.json")."
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
-      # and nothing else. Every provenance value - repository, commit, tag, run - is read from the
-      # OIDC token by the Platform, so writing them here would achieve nothing: they are ignored.
+      # and nothing else. The package identifier is the manifest's own `id`, so the upload can never
+      # name a different package than the one it contains. Every provenance value - repository,
+      # commit, tag, run - is read from the OIDC token by the Platform, so writing them here would
+      # achieve nothing: they are ignored.
       - name: Pack the upload
         env:
           PACKAGE_PATH: ${{ steps.build.outputs.package-path }}
-          PACKAGE_ID: ${{ inputs.package-id }}
+          SOURCE: ${{ inputs.source }}
           DECLARED_VERSION: ${{ inputs.version }}
           BUILD: ${{ inputs.build }}
           CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
+          package_id="$(jq -r '.id // empty' "${SOURCE}/manifest.json")"
+          if [ -z "${package_id}" ]; then
+            echo "::error file=${SOURCE}/manifest.json::manifest.json has no id."
+            exit 1
+          fi
+          echo "Publishing ${package_id}."
           artifact="$(basename "${PACKAGE_PATH}")"
           mkdir -p "${RUNNER_TEMP}/upload"
           cp "${PACKAGE_PATH}" "${RUNNER_TEMP}/upload/${artifact}"
           jq -n \
-            --arg packageId "${PACKAGE_ID}" \
+            --arg packageId "${package_id}" \
             --arg version "${DECLARED_VERSION#v}" \
             --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
             --arg artifactFileName "${artifact}" \
