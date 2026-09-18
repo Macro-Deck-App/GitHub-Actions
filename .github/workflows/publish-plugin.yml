@@ -772,7 +772,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ needs.plan.outputs.handoff-prefix }}-conformance-${{ matrix.rid }}
-          path: ${{ runner.temp }}/conformance
+          path: ${{ runner.temp }}/conformance/conformance.json
           retention-days: 1
           if-no-files-found: warn
 
@@ -785,6 +785,7 @@ jobs:
       # The only permission this job has, and the only job that has it. Without it the runner cannot
       # mint an OIDC token and the upload has no credential at all - there is no fallback secret.
       id-token: write
+      actions: read
     # From `package` when the build was split per platform, from `build` when one job built everything.
     env:
       HANDOFF: ${{ needs.package.outputs.handoff || needs.build.outputs.handoff }}
@@ -803,6 +804,7 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           CONFORMANCE_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}-conformance-
           STUB_HOST_MATRIX: ${{ needs.plan.outputs.stub-host-matrix }}
         run: |
