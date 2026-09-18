@@ -56,8 +56,8 @@ The workflow runs these jobs, in this order:
 | `plan` | `ubuntu-latest` | `contents: read` | Reads the manifest's entrypoints and decides which platforms are built, on which runners |
 | `build` | `ubuntu-latest`, or one per platform | `contents: read` | Builds the `.macroDeckPlugin`, runs the repository's tests, lists the dependencies |
 | `package` | `ubuntu-latest` | none | Only with `build-per-platform`: merges the platform packages into one |
-| `stub-host` | one the manifest declares | none | Runs the plugin conformance suite against the package on a disposable stub host and hands its report to the upload |
-| `upload` | `ubuntu-latest` | `id-token: write` | Packs `build-metadata.json`, the dependency list and the conformance report, and uploads the build to the Platform |
+| `stub-host` | one per platform the manifest declares | none | Runs the plugin conformance suite against the package on a disposable stub host on each platform and hands the reports to the upload |
+| `upload` | `ubuntu-latest` | `id-token: write` | Packs `build-metadata.json`, the dependency list and the conformance reports, and uploads the build to the Platform |
 
 - **Only the upload job can authenticate.** Every step of a job with `id-token: write` can request
   the OIDC token the Platform accepts, including build scripts, MSBuild targets and tests. So nothing
@@ -73,10 +73,13 @@ The workflow runs these jobs, in this order:
 - **Stub host.** `macrodeck-plugin test --artifact` starts the package the way Macro Deck does and
   checks registration, protocol negotiation, capabilities, timeouts, disconnect and reconnect. The
   full report is the job's summary; only a failed required check stops the release. The plugin runs
-  on its own platform, so the job picks the first runner the manifest declares an entrypoint for:
-  `linux-x64` (`ubuntu-latest`), `win-x64` (`windows-latest`), `osx-arm64` (`macos-latest`),
-  `linux-arm64` (`ubuntu-24.04-arm`), `win-arm64` (`windows-11-arm`), `osx-x64` (`macos-15-intel`). A
-  plugin declaring none of them is not run, with a warning.
+  on its own platform, so there is one job for every platform the manifest declares an entrypoint for,
+  each on a runner of that platform: `linux-x64` (`ubuntu-latest`), `win-x64` (`windows-latest`),
+  `osx-arm64` (`macos-latest`), `linux-arm64` (`ubuntu-24.04-arm`), `win-arm64` (`windows-11-arm`),
+  `osx-x64` (`macos-15-intel`), or the runner `runners` names. A Windows entrypoint is run on Windows,
+  a macOS one on macOS, a Linux one on Linux. One platform failing does not cancel the others, and any
+  of them failing a required check stops the release. A platform without a runner is not run, with a
+  warning.
 
 The calling job still grants `id-token: write`, as in the example above: a reusable workflow's jobs
 can only narrow the caller's permissions, not add to them.
@@ -188,9 +191,10 @@ plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bi
 ## Conformance report
 
 The `stub-host` job runs `macrodeck-plugin test --artifact` against the built package and writes the
-report as JSON (the conformance suite's own format, `ConformanceReportWriter.ToJson`). It is rendered
-into the job summary and uploaded with the build as `conformance.json`. The Creator Portal shows it to
-the moderator in the review's Conformance tab.
+report as JSON (the conformance suite's own format, `ConformanceReportWriter.ToJson`), once per
+platform. Each is rendered into its job's summary and uploaded with the build as
+`conformance/<rid>.json`, for example `conformance/win-x64.json`. The Creator Portal shows them to the
+moderator in the review's Conformance tab, one tab per platform, opening on the worst.
 
 It is optional and advisory:
 

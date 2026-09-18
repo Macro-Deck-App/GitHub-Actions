@@ -20,7 +20,7 @@
 # the work is split into separate jobs:
 #
 #   plan       reads the manifest's entrypoints and decides which runtime identifiers are built, on
-#              which runners, and which runner the stub host uses. Checks the repository out but runs
+#              which runners, and on which runners the stub host runs. Checks the repository out but runs
 #              none of its code; holds `contents: read`.
 #   build      builds the package, runs the repository's tests and lists the dependencies. Runs the
 #              creator's code, holds `contents: read` and nothing else. With build-per-platform it is
@@ -30,11 +30,11 @@
 #   package    only with build-per-platform: combines those single-platform packages into the one
 #              multi-platform package with `macrodeck-plugin merge`. Checks nothing out, runs none of
 #              the creator's code and holds no permission.
-#   stub-host  runs the conformance suite against the built package on a disposable stub host, on a
-#              runner whose platform the manifest declares, and hands its JSON report to the upload.
-#              Runs the plugin, holds no permission.
-#   upload     packs build-metadata.json, the dependency list and the conformance report, if there is
-#              one, and uploads to the Platform. Holds `id-token: write` only, checks nothing out and
+#   stub-host  runs the conformance suite against the built package on a disposable stub host, as a
+#              matrix of one job per platform the manifest declares, each on a runner of that platform,
+#              and hands the JSON reports to the upload. Runs the plugin, holds no permission.
+#   upload     packs build-metadata.json, the dependency list and the conformance reports, one per
+#              platform, if there are any, and uploads to the Platform. Holds `id-token: write` only, checks nothing out and
 #              executes nothing from the repository.
 #
 # The package moves between the jobs as a workflow artifact. Its SHA-256 is recorded right after the
@@ -83,7 +83,7 @@ on:
           (linux-x64 ubuntu-latest, win-x64 windows-latest, osx-arm64 macos-latest, linux-arm64
           ubuntu-24.04-arm, win-arm64 windows-11-arm, osx-x64 macos-15-intel). Use it for a self-hosted
           runner or a pinned image, for example {"osx-arm64": "macos-15"}. Read with
-          build-per-platform, and for the stub host runner.
+          build-per-platform, and for the stub host runners.
         required: false
         type: string
         default: '{}'
@@ -149,7 +149,7 @@ on:
 jobs:
   # Only the manifest decides what is built: the runtime identifiers it declares entrypoints for. This
   # job reads them and nothing else - it never runs a build script - so the matrix below, and the stub
-  # host's runner, are settled before any of the repository's code has run.
+  # host's runners, are settled before any of the repository's code has run.
   plan:
     name: Plan the build
     runs-on: ubuntu-latest
@@ -157,7 +157,7 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      stub-host-runner: ${{ steps.plan.outputs.stub-host-runner }}
+      stub-host-matrix: ${{ steps.plan.outputs.stub-host-matrix }}
       handoff-prefix: ${{ steps.plan.outputs.handoff-prefix }}
     steps:
       - name: Check out the reviewed commit
@@ -204,7 +204,7 @@ jobs:
           }')"
 
           # Declared platforms, Linux first: the first of them runs the tests and the dependency
-          # listing, and is the stub host's runner, and both are cheapest and best supported there. A
+          # listing, which are cheapest and best supported there. A
           # platform the defaults do not know keeps its declared order, after the ones they do.
           ordered=""
           for rid in linux-x64 win-x64 osx-arm64 linux-arm64 win-arm64 osx-x64; do
@@ -240,14 +240,28 @@ jobs:
           jq -c -n --argjson entries "${include}" '{"include": $entries}' \
             | sed 's/^/matrix=/' >> "${GITHUB_OUTPUT}"
 
-          # The stub host runs the package's entrypoint for the runner's own platform, so it needs a
-          # runner of a platform the manifest declares. A plugin declaring none that a runner provides
-          # is not run on a stub host.
-          stub_host_runner="$(jq -r --arg rid "$(printf '%s' "${ordered}" | head -n 1)" '.[$rid] // empty' <<< "${runners}")"
-          echo "stub-host-runner=${stub_host_runner}" >> "${GITHUB_OUTPUT}"
-          if [ -n "${stub_host_runner}" ]; then
-            echo "The stub host runs the plugin on ${stub_host_runner}."
+          # The stub host runs the package's entrypoint for the runner's own platform, so every
+          # declared platform is run on a runner of its own: a Windows entrypoint on Windows, a macOS
+          # one on macOS, a Linux one on Linux. A platform no runner is known for is not run. A matrix
+          # cannot be empty, so a plugin declaring no runnable platform gets one entry without a
+          # runtime identifier, which only warns.
+          stub_hosts='[]'
+          while read -r rid; do
+            [ -n "${rid}" ] || continue
+            os="$(jq -r --arg rid "${rid}" '.[$rid] // empty' <<< "${runners}")"
+            if [ -z "${os}" ]; then
+              echo "::warning::No runner is known for ${rid}, so its entrypoint is not run on a stub host. Name one in the runners input to run it."
+              continue
+            fi
+            stub_hosts="$(jq -c --arg rid "${rid}" --arg os "${os}" '. + [{rid: $rid, os: $os}]' <<< "${stub_hosts}")"
+          done <<< "${ordered}"
+          if [ "$(jq 'length' <<< "${stub_hosts}")" -gt 0 ]; then
+            echo "The stub host runs $(jq -r '[.[] | "\(.rid) on \(.os)"] | join(", ")' <<< "${stub_hosts}")."
+          else
+            stub_hosts='[{"rid": "", "os": "ubuntu-latest"}]'
           fi
+          jq -c -n --argjson entries "${stub_hosts}" '{"include": $entries}' \
+            | sed 's/^/stub-host-matrix=/' >> "${GITHUB_OUTPUT}"
 
           # Names the run's handoff artifacts. Unique per call, so a caller publishing several plugins
           # in one run gets its own set for each.
@@ -657,14 +671,18 @@ jobs:
           if-no-files-found: error
 
   stub-host:
-    name: Run on a stub host
+    name: Run on a stub host${{ matrix.rid && format(' {0}', matrix.rid) || '' }}
     needs: [plan, build, package]
     # `package` is skipped unless the build was split per platform, and a skipped dependency skips this
     # job unless the condition says otherwise.
     if: ${{ !cancelled() && inputs.run-stub-host && needs.build.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') }}
-    runs-on: ${{ needs.plan.outputs.stub-host-runner || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions: {}
+    strategy:
+      # Every platform reports, even when another one already failed.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.stub-host-matrix) }}
     # From `package` when the build was split per platform, from `build` when one job built everything.
     env:
       HANDOFF: ${{ needs.package.outputs.handoff || needs.build.outputs.handoff }}
@@ -672,20 +690,20 @@ jobs:
       SHA256: ${{ needs.package.outputs.sha256 || needs.build.outputs.sha256 }}
     steps:
       - name: No runnable platform
-        if: ${{ needs.plan.outputs.stub-host-runner == '' }}
+        if: ${{ matrix.rid == '' }}
         shell: bash
         run: |
           echo "::warning::The manifest declares no platform a runner provides (linux-x64, win-x64, osx-arm64, linux-arm64, win-arm64, osx-x64), so the plugin was not run on a stub host."
 
       - name: Download the package
-        if: ${{ needs.plan.outputs.stub-host-runner != '' }}
+        if: ${{ matrix.rid != '' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ env.HANDOFF }}
           path: ${{ runner.temp }}/handoff
 
       - name: Check the package digest
-        if: ${{ needs.plan.outputs.stub-host-runner != '' }}
+        if: ${{ matrix.rid != '' }}
         shell: bash
         env:
           PACKAGE: ${{ runner.temp }}/handoff/${{ env.PACKAGE_FILE_NAME }}
@@ -702,7 +720,7 @@ jobs:
           fi
 
       - name: Set up the Macro Deck plugin CLI
-        if: ${{ needs.plan.outputs.stub-host-runner != '' }}
+        if: ${{ matrix.rid != '' }}
         uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
         with:
           cli-version: ${{ inputs.cli-version }}
@@ -711,7 +729,7 @@ jobs:
       # disposable stub host. Only a failed required check fails the run. The JSON report goes to the
       # Platform with the build, for the moderator; the job summary is rendered from it.
       - name: Run the conformance suite
-        if: ${{ needs.plan.outputs.stub-host-runner != '' }}
+        if: ${{ matrix.rid != '' }}
         shell: bash
         env:
           PACKAGE: ${{ runner.temp }}/handoff/${{ env.PACKAGE_FILE_NAME }}
@@ -749,10 +767,10 @@ jobs:
       # Written by the job that ran the plugin, so the Platform treats it as advisory: the moderator reads
       # it, it never decides anything.
       - name: Hand the report over
-        if: ${{ needs.plan.outputs.stub-host-runner != '' }}
+        if: ${{ matrix.rid != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ needs.plan.outputs.handoff-prefix }}-conformance
+          name: ${{ needs.plan.outputs.handoff-prefix }}-conformance-${{ matrix.rid }}
           path: ${{ runner.temp }}/conformance
           retention-days: 1
           if-no-files-found: warn
@@ -778,13 +796,14 @@ jobs:
           name: ${{ env.HANDOFF }}
           path: ${{ runner.temp }}/handoff
 
-      # Optional: there is none when the stub host was skipped, and its absence never fails the upload.
-      - name: Download the conformance report
+      # Optional: there are none when the stub host was skipped, and their absence never fails the
+      # upload. One directory per platform, named after its artifact.
+      - name: Download the conformance reports
         if: ${{ needs.stub-host.result == 'success' }}
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ needs.plan.outputs.handoff-prefix }}-conformance
+          pattern: ${{ needs.plan.outputs.handoff-prefix }}-conformance-*
           path: ${{ runner.temp }}/conformance
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
@@ -797,6 +816,8 @@ jobs:
           DECLARED_VERSION: ${{ inputs.version }}
           BUILD: ${{ inputs.build }}
           CHANGELOG: ${{ inputs.changelog }}
+          CONFORMANCE_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}-conformance-
+          STUB_HOST_MATRIX: ${{ needs.plan.outputs.stub-host-matrix }}
         run: |
           set -euo pipefail
           handoff="${RUNNER_TEMP}/handoff"
@@ -820,11 +841,21 @@ jobs:
             exit 1
           fi
           cp "${handoff}/dependencies.json" "${upload}/dependencies.json"
-          # Optional, and sent as the suite wrote it: the Platform never refuses a build over it, and
-          # shows the moderator a report it cannot read as such.
-          conformance="${RUNNER_TEMP}/conformance/conformance.json"
-          if [ -f "${conformance}" ]; then
-            cp "${conformance}" "${upload}/conformance.json"
+          # Optional, and sent as the suite wrote them: the Platform never refuses a build over one, and
+          # shows the moderator a report it cannot read as such. One per platform, named after it, so
+          # the review shows each in a tab of its own.
+          reports=""
+          while read -r rid; do
+            [ -n "${rid}" ] || continue
+            report="${RUNNER_TEMP}/conformance/${CONFORMANCE_PREFIX}${rid}/conformance.json"
+            if [ -f "${report}" ]; then
+              mkdir -p "${upload}/conformance"
+              cp "${report}" "${upload}/conformance/${rid}.json"
+              reports="${reports:+${reports}, }${rid}"
+            fi
+          done < <(jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}")
+          if [ -n "${reports}" ]; then
+            echo "Uploading the conformance reports of ${reports}."
           else
             echo "::warning::No conformance report is uploaded: the plugin was not run on a stub host. The moderator is told so."
           fi
