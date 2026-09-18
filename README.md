@@ -56,8 +56,8 @@ The workflow runs these jobs, in this order:
 | `plan` | `ubuntu-latest` | `contents: read` | Reads the manifest's entrypoints and decides which platforms are built, on which runners |
 | `build` | `ubuntu-latest`, or one per platform | `contents: read` | Builds the `.macroDeckPlugin`, runs the repository's tests, lists the dependencies |
 | `package` | `ubuntu-latest` | none | Only with `build-per-platform`: merges the platform packages into one |
-| `stub-host` | one the manifest declares | none | Runs the plugin conformance suite against the package on a disposable stub host |
-| `upload` | `ubuntu-latest` | `id-token: write` | Packs `build-metadata.json` and uploads the build to the Platform |
+| `stub-host` | one the manifest declares | none | Runs the plugin conformance suite against the package on a disposable stub host and hands its report to the upload |
+| `upload` | `ubuntu-latest` | `id-token: write` | Packs `build-metadata.json`, the dependency list and the conformance report, and uploads the build to the Platform |
 
 - **Only the upload job can authenticate.** Every step of a job with `id-token: write` can request
   the OIDC token the Platform accepts, including build scripts, MSBuild targets and tests. So nothing
@@ -115,8 +115,11 @@ with the build as `dependencies.json`. The Creator Portal shows them per build, 
 from it and to the moderator reviewing it, and the Platform's security scan reads them. Nothing has to
 be configured.
 
-It is optional and never fails a release: if the project cannot be found or listed, the file is left
-out with a warning and the build is uploaded without it.
+It is required: the Platform refuses a build without it, and checks it against the dependency policy
+its System Administrators set - `MacroDeck.*` packages must be official Macro Deck packages and
+reach a minimum version, and packages no
+plugin may depend on, directly or transitively. If the project cannot be found or listed, the release
+fails with the reason, and a refusal by the policy names each offending package.
 
 - **The project** is the one `macrodeck-build.json` publishes (the first `*.csproj`, `*.fsproj` or
   `*.vbproj` argument of a `dotnet` target), or else the only project file in `source`.
@@ -182,6 +185,28 @@ out with a warning and the build is uploaded without it.
 The list is trusted exactly as much as the build: it is written by this workflow, in the job the
 plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bill of materials.
 
+## Conformance report
+
+The `stub-host` job runs `macrodeck-plugin test --artifact` against the built package and writes the
+report as JSON (the conformance suite's own format, `ConformanceReportWriter.ToJson`). It is rendered
+into the job summary and uploaded with the build as `conformance.json`. The Creator Portal shows it to
+the moderator in the review's Conformance tab.
+
+It is optional and advisory:
+
+- **A failed required check still stops the release**, as before, so nothing is uploaded.
+- **No report** - `run-stub-host: false`, or a manifest that declares no platform a GitHub runner
+  provides - uploads the build without one. The review warns that the plugin was never run on a
+  stub host.
+- **A report the Platform cannot read** never refuses the build; the review shows it as a warning,
+  with the reason.
+- The review also warns when the plugin never completed the handshake with the stub host, when no
+  check passed, when recommended checks failed or checks were inconclusive, and when the report names
+  another plugin id or version than the build.
+
+The report comes from the job that ran the plugin, so it is trusted no further than the build. It
+tells a moderator what to look at; it decides nothing.
+
 ## Inputs
 
 | Input | Required | Description |
@@ -194,7 +219,7 @@ plugin's own MSBuild code runs in. It helps a moderator; it is not a verified bi
 | `changelog` | no | Becomes the default changelog of a release started from the build. |
 | `run-tests` | no | Runs the repository's tests after the build. Defaults to `true`. |
 | `test-path` | no | The solution, project or directory `dotnet test` runs; defaults to the only solution at the repository root. |
-| `run-stub-host` | no | Runs the conformance suite on a stub host before the upload. Defaults to `true`. |
+| `run-stub-host` | no | Runs the conformance suite on a stub host before the upload and uploads its report. Defaults to `true`. |
 | `cli-version` | no | `MacroDeck.Plugin.Cli` version; defaults to the newest release carrying every command these actions use (`3.0.0-beta.11`). |
 | `upload-artifact` | no | `true` also keeps the `.macroDeckPlugin` as a workflow artifact. Defaults to `false`. |
 | `artifact-name` | no | The artifact's name; defaults to the package file name. |

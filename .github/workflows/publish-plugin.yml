@@ -31,9 +31,11 @@
 #              multi-platform package with `macrodeck-plugin merge`. Checks nothing out, runs none of
 #              the creator's code and holds no permission.
 #   stub-host  runs the conformance suite against the built package on a disposable stub host, on a
-#              runner whose platform the manifest declares. Runs the plugin, holds no permission.
-#   upload     packs build-metadata.json and uploads to the Platform. Holds `id-token: write` only,
-#              checks nothing out and executes nothing from the repository.
+#              runner whose platform the manifest declares, and hands its JSON report to the upload.
+#              Runs the plugin, holds no permission.
+#   upload     packs build-metadata.json, the dependency list and the conformance report, if there is
+#              one, and uploads to the Platform. Holds `id-token: write` only, checks nothing out and
+#              executes nothing from the repository.
 #
 # The package moves between the jobs as a workflow artifact. Its SHA-256 is recorded right after the
 # build, checked again before the build job hands it over (so the tests cannot have swapped it), and
@@ -105,7 +107,9 @@ on:
       run-stub-host:
         description: >-
           Run the plugin conformance suite (`macrodeck-plugin test`) against the built package on a
-          disposable stub host. A required check that fails stops the release.
+          disposable stub host. A required check that fails stops the release; otherwise the report is
+          uploaded with the build as conformance.json and shown to the moderator reviewing it. Without
+          it the review warns that the plugin was never run on a stub host.
         required: false
         type: boolean
         default: true
@@ -361,15 +365,14 @@ jobs:
           echo "Testing ${target}."
           dotnet test "${target}" -c Release
 
-      # Optional. The NuGet packages the build restored, for the moderator and the security scan: each
-      # package with its resolved version, whether the project references it directly, the feed it
-      # came from and any known vulnerability. Nothing here can fail the release - on any problem the
-      # file is left out with a warning and the upload goes ahead without it. The schema is in the
-      # README. The Platform refuses a file that breaks it, so this step keeps within its limits
-      # (1 MiB, 5,000 packages) rather than send one that would fail the upload.
+      # Required. The NuGet packages the build restored, for the Platform's dependency policy (minimum
+      # Macro Deck SDK version, blocked packages), the moderator and the security scan: each package
+      # with its resolved version, whether the project references it directly, the feed it came from
+      # and any known vulnerability. The Platform refuses an upload without it, so any problem here
+      # fails the release. The schema is in the README; this step keeps within the Platform's limits
+      # (1 MiB, 5,000 packages) and fails rather than send a file the Platform would refuse.
       - name: List the dependencies
         if: ${{ matrix.primary }}
-        continue-on-error: true
         env:
           SOURCE: ${{ inputs.source }}
         run: |
@@ -378,9 +381,9 @@ jobs:
           rm -rf "${work}"
           mkdir -p "${work}" "${RUNNER_TEMP}/upload"
           rm -f "${RUNNER_TEMP}/upload/dependencies.json"
-          skip() {
-            echo "::warning::The build is uploaded without a dependency list: $1"
-            exit 0
+          fail() {
+            echo "::error title=No dependency list::The dependencies could not be listed, and the Platform refuses a build without them: $1"
+            exit 1
           }
 
           # The project macrodeck-build.json publishes, or else the only project file beside it.
@@ -394,25 +397,25 @@ jobs:
             shopt -s nullglob
             candidates=("${SOURCE}"/*.csproj "${SOURCE}"/*.fsproj "${SOURCE}"/*.vbproj)
             shopt -u nullglob
-            [ "${#candidates[@]}" -eq 1 ] || skip "no single project file was found in ${SOURCE}."
+            [ "${#candidates[@]}" -eq 1 ] || fail "no single project file was found in ${SOURCE}."
             project="$(basename "${candidates[0]}")"
           fi
           case "${project}" in
             /*) project_path="${project}" ;;
             *) project_path="${SOURCE}/${project}" ;;
           esac
-          [ -f "${project_path}" ] || skip "${project_path} does not exist."
+          [ -f "${project_path}" ] || fail "${project_path} does not exist."
 
           assets="$(dotnet msbuild "${project_path}" -getProperty:ProjectAssetsFile 2>/dev/null | tail -n 1)" || assets=""
           if [ -z "${assets}" ] || [ ! -f "${assets}" ]; then
-            dotnet restore "${project_path}" > "${work}/restore.log" 2>&1 || skip "the project could not be restored."
+            dotnet restore "${project_path}" > "${work}/restore.log" 2>&1 || fail "the project could not be restored."
             assets="$(dirname "${project_path}")/obj/project.assets.json"
           fi
-          [ -f "${assets}" ] || skip "the project's assets file was not found."
+          [ -f "${assets}" ] || fail "the project's assets file was not found."
 
           dotnet list "${project_path}" package --include-transitive --format json \
             > "${work}/packages.json" 2> "${work}/packages.log" \
-            || skip "dotnet list package failed."
+            || fail "dotnet list package failed."
 
           # Needs the feeds' vulnerability data (nuget.org's). If it cannot be reached, only this part
           # is lost, and the list says it was not checked.
@@ -430,14 +433,14 @@ jobs:
           jq -r '(.packageFolders // {} | keys[]) as $folder | .libraries // {} | to_entries[]
             | select(.value.type == "package")
             | [(.key | ascii_downcase), "\($folder | rtrimstr("/"))/\(.value.path)/.nupkg.metadata"] | @tsv' \
-            "${assets}" > "${work}/libraries.tsv" || skip "the assets file could not be read."
+            "${assets}" > "${work}/libraries.tsv" || fail "the assets file could not be read."
           while IFS=$'\t' read -r key metadata; do
             [ -f "${metadata}" ] || continue
             feed="$(jq -r '.source // empty' "${metadata}" 2>/dev/null)" || continue
             [ -n "${feed}" ] && printf '%s\t%s\n' "${key}" "${feed}"
           done < "${work}/libraries.tsv" > "${work}/resolved.tsv"
           jq -Rn '[inputs | split("\t") | {key: .[0], value: .[1]}] | reverse | from_entries' \
-            "${work}/resolved.tsv" > "${work}/resolved.json" || skip "the package feeds could not be read."
+            "${work}/resolved.tsv" > "${work}/resolved.json" || fail "the package feeds could not be read."
 
           jq -n \
             --slurpfile packages "${work}/packages.json" \
@@ -480,13 +483,13 @@ jobs:
                   ]
                 }]
               }
-            ' > "${work}/dependencies.json" || skip "the dependency list could not be assembled."
+            ' > "${work}/dependencies.json" || fail "the dependency list could not be assembled."
 
           count="$(jq '[.frameworks[].packages | length] | add // 0' "${work}/dependencies.json")" \
-            || skip "the dependency list could not be read back."
+            || fail "the dependency list could not be read back."
           size="$(wc -c < "${work}/dependencies.json" | tr -d ' ')"
-          [ "${count}" -le 5000 ] || skip "${count} packages is more than the 5,000 the Platform accepts."
-          [ "${size}" -le 1048576 ] || skip "the list is larger than the 1 MiB the Platform accepts."
+          [ "${count}" -le 5000 ] || fail "${count} packages is more than the 5,000 the Platform accepts."
+          [ "${size}" -le 1048576 ] || fail "the list is larger than the 1 MiB the Platform accepts."
           mv "${work}/dependencies.json" "${RUNNER_TEMP}/upload/dependencies.json"
           echo "Listed ${count} package references for $(jq -r '[.frameworks[].framework] | join(", ")' "${RUNNER_TEMP}/upload/dependencies.json")."
 
@@ -638,9 +641,11 @@ jobs:
           cp "${PACKAGE_PATH}" "${handoff}/"
           # One build listed the dependencies; the list is about the project, not a platform.
           dependencies="$(find "${PLATFORMS}" -name dependencies.json -print -quit)"
-          if [ -n "${dependencies}" ]; then
-            cp "${dependencies}" "${handoff}/dependencies.json"
+          if [ -z "${dependencies}" ]; then
+            echo "::error::No build handed over a dependency list, and the Platform refuses a build without one."
+            exit 1
           fi
+          cp "${dependencies}" "${handoff}/dependencies.json"
           echo "name=${HANDOFF_PREFIX}-package" >> "${GITHUB_OUTPUT}"
 
       - name: Upload the handoff
@@ -703,8 +708,8 @@ jobs:
           cli-version: ${{ inputs.cli-version }}
 
       # Registration, protocol negotiation, capabilities, timeouts, disconnect and reconnect, against a
-      # disposable stub host. Only a failed required check fails the run; the whole report is the job
-      # summary.
+      # disposable stub host. Only a failed required check fails the run. The JSON report goes to the
+      # Platform with the build, for the moderator; the job summary is rendered from it.
       - name: Run the conformance suite
         if: ${{ needs.plan.outputs.stub-host-runner != '' }}
         shell: bash
@@ -712,11 +717,27 @@ jobs:
           PACKAGE: ${{ runner.temp }}/handoff/${{ env.PACKAGE_FILE_NAME }}
         run: |
           set -uo pipefail
-          report="${RUNNER_TEMP}/conformance.md"
-          macrodeck-plugin test --artifact "${PACKAGE}" --report markdown --output "${report}"
+          report="${RUNNER_TEMP}/conformance/conformance.json"
+          rm -rf "${RUNNER_TEMP}/conformance"
+          mkdir -p "${RUNNER_TEMP}/conformance"
+          macrodeck-plugin test --artifact "${PACKAGE}" --report json --output "${report}"
           status=$?
           if [ -f "${report}" ]; then
-            cat "${report}" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              def cell: tostring | gsub("\\|"; "\\|") | gsub("\n"; " ");
+              def tag: {passed: "PASS", failed: "FAIL", skipped: "SKIP", inconclusive: "INCONCLUSIVE"}[.] // .;
+              "# Macro Deck plugin conformance report\n",
+              "Suite version: `\(.suiteVersion)`  ",
+              "Plugin: `\(.pluginId // "(unknown)")` `\(.pluginVersion // "(unknown)")`  ",
+              "Conformant: **\(if .conformant then "yes" else "no" end)**  ",
+              "Passed: \(.passed) - Failed: \(.failed) - Skipped: \(.skipped)\n",
+              "| Id | Title | Requirement | Outcome | Detail |",
+              "|---|---|---|---|---|",
+              (.results[] | "| \(.id) | \(.title | cell) | \(.requirement) | \(.result.outcome | tag) | \(
+                if .result.outcome == "failed" then "Expected: \(.result.expected // "" | cell)<br>Actual: \(.result.actual // "" | cell)"
+                else (.result.skipReason // "" | cell) end) |")
+            ' "${report}" >> "${GITHUB_STEP_SUMMARY}" \
+              || echo "::warning::The conformance report could not be summarised."
           fi
           case "${status}" in
             0) echo "The plugin passed every required conformance check." ;;
@@ -725,9 +746,20 @@ jobs:
           esac
           exit "${status}"
 
+      # Written by the job that ran the plugin, so the Platform treats it as advisory: the moderator reads
+      # it, it never decides anything.
+      - name: Hand the report over
+        if: ${{ needs.plan.outputs.stub-host-runner != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.handoff-prefix }}-conformance
+          path: ${{ runner.temp }}/conformance
+          retention-days: 1
+          if-no-files-found: warn
+
   upload:
     name: Upload to the Platform
-    needs: [build, package, stub-host]
+    needs: [plan, build, package, stub-host]
     if: ${{ !cancelled() && needs.build.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.stub-host.result == 'success' || needs.stub-host.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
@@ -745,6 +777,15 @@ jobs:
         with:
           name: ${{ env.HANDOFF }}
           path: ${{ runner.temp }}/handoff
+
+      # Optional: there is none when the stub host was skipped, and its absence never fails the upload.
+      - name: Download the conformance report
+        if: ${{ needs.stub-host.result == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.plan.outputs.handoff-prefix }}-conformance
+          path: ${{ runner.temp }}/conformance
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. The package identifier is the id in the package's own manifest.json, so the
@@ -774,8 +815,18 @@ jobs:
           rm -rf "${upload}"
           mkdir -p "${upload}"
           cp "${package}" "${upload}/${PACKAGE_FILE_NAME}"
-          if [ -f "${handoff}/dependencies.json" ]; then
-            cp "${handoff}/dependencies.json" "${upload}/dependencies.json"
+          if [ ! -f "${handoff}/dependencies.json" ]; then
+            echo "::error::The build handed over no dependency list, and the Platform refuses a build without one."
+            exit 1
+          fi
+          cp "${handoff}/dependencies.json" "${upload}/dependencies.json"
+          # Optional, and sent as the suite wrote it: the Platform never refuses a build over it, and
+          # shows the moderator a report it cannot read as such.
+          conformance="${RUNNER_TEMP}/conformance/conformance.json"
+          if [ -f "${conformance}" ]; then
+            cp "${conformance}" "${upload}/conformance.json"
+          else
+            echo "::warning::No conformance report is uploaded: the plugin was not run on a stub host. The moderator is told so."
           fi
           jq -n \
             --arg packageId "${package_id}" \
