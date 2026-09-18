@@ -336,11 +336,12 @@ jobs:
           PACKAGE_PATH: ${{ steps.build.outputs.package-path }}
         run: |
           set -euo pipefail
-          # macOS has shasum where Linux and Git for Windows have sha256sum.
+          # macOS has shasum where Linux and Git for Windows have sha256sum. Always hash stdin: given a
+          # path with a backslash, as every path on Windows has, sha256sum prefixes its line with `\`.
           if command -v sha256sum > /dev/null; then
-            sha256="$(sha256sum "${PACKAGE_PATH}" | cut -d' ' -f1)"
+            sha256="$(sha256sum < "${PACKAGE_PATH}" | cut -d' ' -f1)"
           else
-            sha256="$(shasum -a 256 "${PACKAGE_PATH}" | cut -d' ' -f1)"
+            sha256="$(shasum -a 256 < "${PACKAGE_PATH}" | cut -d' ' -f1)"
           fi
           echo "sha256=${sha256}" >> "${GITHUB_OUTPUT}"
           echo "Built $(basename "${PACKAGE_PATH}") (SHA-256 ${sha256})."
@@ -520,12 +521,12 @@ jobs:
         run: |
           set -euo pipefail
           if command -v sha256sum > /dev/null; then
-            actual="$(sha256sum "${PACKAGE_PATH}" | cut -d' ' -f1)"
+            actual="$(sha256sum < "${PACKAGE_PATH}" | cut -d' ' -f1)"
           else
-            actual="$(shasum -a 256 "${PACKAGE_PATH}" | cut -d' ' -f1)"
+            actual="$(shasum -a 256 < "${PACKAGE_PATH}" | cut -d' ' -f1)"
           fi
           if [ "${actual}" != "${SHA256}" ]; then
-            echo "::error::The package changed after it was built."
+            echo "::error::The package changed after it was built: its SHA-256 is ${actual}, the build recorded ${SHA256}."
             exit 1
           fi
           handoff="${RUNNER_TEMP}/handoff"
@@ -628,7 +629,7 @@ jobs:
           PACKAGE_PATH: ${{ steps.merge.outputs.package-path }}
         run: |
           set -euo pipefail
-          sha256="$(sha256sum "${PACKAGE_PATH}" | cut -d' ' -f1)"
+          sha256="$(sha256sum < "${PACKAGE_PATH}" | cut -d' ' -f1)"
           echo "sha256=${sha256}" >> "${GITHUB_OUTPUT}"
           echo "Merged $(basename "${PACKAGE_PATH}") (SHA-256 ${sha256})."
 
@@ -710,12 +711,12 @@ jobs:
         run: |
           set -euo pipefail
           if command -v sha256sum > /dev/null; then
-            actual="$(sha256sum "${PACKAGE}" | cut -d' ' -f1)"
+            actual="$(sha256sum < "${PACKAGE}" | cut -d' ' -f1)"
           else
-            actual="$(shasum -a 256 "${PACKAGE}" | cut -d' ' -f1)"
+            actual="$(shasum -a 256 < "${PACKAGE}" | cut -d' ' -f1)"
           fi
           if [ "${actual}" != "${SHA256}" ]; then
-            echo "::error::The package is not the one the build produced."
+            echo "::error::$(basename "${PACKAGE}") is not the package the build produced: its SHA-256 is ${actual}, the build recorded ${SHA256}."
             exit 1
           fi
 
@@ -822,8 +823,9 @@ jobs:
           set -euo pipefail
           handoff="${RUNNER_TEMP}/handoff"
           package="${handoff}/${PACKAGE_FILE_NAME}"
-          if [ "$(sha256sum "${package}" | cut -d' ' -f1)" != "${SHA256}" ]; then
-            echo "::error::The package is not the one the build produced."
+          actual="$(sha256sum < "${package}" | cut -d' ' -f1)"
+          if [ "${actual}" != "${SHA256}" ]; then
+            echo "::error::${PACKAGE_FILE_NAME} is not the package the build produced: its SHA-256 is ${actual}, the build recorded ${SHA256}."
             exit 1
           fi
           package_id="$(unzip -p "${package}" manifest.json | jq -r '.id // empty')"
