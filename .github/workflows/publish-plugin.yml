@@ -796,17 +796,40 @@ jobs:
         with:
           name: ${{ env.HANDOFF }}
           path: ${{ runner.temp }}/handoff
-
       # Optional: there are none when the stub host was skipped, and their absence never fails the
       # upload. One directory per platform, named after its artifact.
       - name: Download the conformance reports
         if: ${{ needs.stub-host.result == 'success' }}
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ needs.plan.outputs.handoff-prefix }}-conformance-*
-          path: ${{ runner.temp }}/conformance
-          merge-multiple: false
+        shell: bash
+        env:
+          CONFORMANCE_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}-conformance-
+          STUB_HOST_MATRIX: ${{ needs.plan.outputs.stub-host-matrix }}
+        run: |
+          set -euo pipefail
+
+          rm -rf "${RUNNER_TEMP}/conformance"
+          mkdir -p "${RUNNER_TEMP}/conformance"
+
+          while read -r rid; do
+            [ -n "${rid}" ] || continue
+
+            artifact="${CONFORMANCE_PREFIX}${rid}"
+            destination="${RUNNER_TEMP}/conformance/${rid}"
+
+            mkdir -p "${destination}"
+
+            echo "Downloading ${artifact}..."
+
+            gh run download "${GITHUB_RUN_ID}" \
+              --name "${artifact}" \
+              --dir "${destination}" \
+              || echo "::warning::No conformance artifact found for ${rid}."
+
+          done < <(jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}")
+
+          echo "Downloaded conformance reports:"
+          find "${RUNNER_TEMP}/conformance" -type f -print || true
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. The package identifier is the id in the package's own manifest.json, so the
@@ -867,7 +890,7 @@ jobs:
           while read -r rid; do
             [ -n "${rid}" ] || continue
 
-            report="${RUNNER_TEMP}/conformance/${CONFORMANCE_PREFIX}${rid}/conformance.json"
+            report="${RUNNER_TEMP}/conformance/${rid}/conformance.json"
 
             if [ -f "${report}" ]; then
               mkdir -p "${upload}/conformance"
