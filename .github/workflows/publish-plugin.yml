@@ -785,7 +785,6 @@ jobs:
       # The only permission this job has, and the only job that has it. Without it the runner cannot
       # mint an OIDC token and the upload has no credential at all - there is no fallback secret.
       id-token: write
-      actions: read
     # From `package` when the build was split per platform, from `build` when one job built everything.
     env:
       HANDOFF: ${{ needs.package.outputs.handoff || needs.build.outputs.handoff }}
@@ -802,36 +801,10 @@ jobs:
       - name: Download the conformance reports
         if: ${{ needs.stub-host.result == 'success' }}
         continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CONFORMANCE_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}-conformance-
-          STUB_HOST_MATRIX: ${{ needs.plan.outputs.stub-host-matrix }}
-        run: |
-          set -euo pipefail
-
-          rm -rf "${RUNNER_TEMP}/conformance"
-          mkdir -p "${RUNNER_TEMP}/conformance"
-
-          while read -r rid; do
-            [ -n "${rid}" ] || continue
-
-            artifact="${CONFORMANCE_PREFIX}${rid}"
-            destination="${RUNNER_TEMP}/conformance/${rid}"
-
-            mkdir -p "${destination}"
-
-            echo "Downloading ${artifact}..."
-
-            gh run download "${GITHUB_RUN_ID}" \
-              --name "${artifact}" \
-              --dir "${destination}" \
-              || echo "::warning::No conformance artifact found for ${rid}."
-
-          done < <(jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}")
-
-          echo "Downloaded conformance reports:"
-          find "${RUNNER_TEMP}/conformance" -type f -print || true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ needs.plan.outputs.handoff-prefix }}-conformance-*
+          path: ${{ runner.temp }}/conformance
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. The package identifier is the id in the package's own manifest.json, so the
@@ -892,7 +865,12 @@ jobs:
           while read -r rid; do
             [ -n "${rid}" ] || continue
 
-            report="${RUNNER_TEMP}/conformance/${rid}/conformance.json"
+            # A pattern matching several artifacts extracts each into a directory named after it; one
+            # matching a single artifact extracts it straight into the path.
+            report="${RUNNER_TEMP}/conformance/${CONFORMANCE_PREFIX}${rid}/conformance.json"
+            if [ ! -f "${report}" ] && [ "$(jq '.include | length' <<< "${STUB_HOST_MATRIX}")" = "1" ]; then
+              report="${RUNNER_TEMP}/conformance/conformance.json"
+            fi
 
             if [ -f "${report}" ]; then
               mkdir -p "${upload}/conformance"
