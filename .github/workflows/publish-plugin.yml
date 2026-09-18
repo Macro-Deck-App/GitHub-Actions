@@ -806,6 +806,7 @@ jobs:
         with:
           pattern: ${{ needs.plan.outputs.handoff-prefix }}-conformance-*
           path: ${{ runner.temp }}/conformance
+          merge-multiple: false
 
       # build-metadata.json says which Project this upload is for, which version and build it is,
       # and nothing else. The package identifier is the id in the package's own manifest.json, so the
@@ -821,55 +822,84 @@ jobs:
           STUB_HOST_MATRIX: ${{ needs.plan.outputs.stub-host-matrix }}
         run: |
           set -euo pipefail
+
           handoff="${RUNNER_TEMP}/handoff"
           package="${handoff}/${PACKAGE_FILE_NAME}"
+
           actual="$(sha256sum < "${package}" | cut -d' ' -f1)"
           if [ "${actual}" != "${SHA256}" ]; then
             echo "::error::${PACKAGE_FILE_NAME} is not the package the build produced: its SHA-256 is ${actual}, the build recorded ${SHA256}."
             exit 1
           fi
+
           package_id="$(unzip -p "${package}" manifest.json | jq -r '.id // empty')"
           if [ -z "${package_id}" ]; then
             echo "::error::The package's manifest.json has no id."
             exit 1
           fi
+
           echo "Publishing ${package_id}."
+
           upload="${RUNNER_TEMP}/upload"
           rm -rf "${upload}"
           mkdir -p "${upload}"
+
           cp "${package}" "${upload}/${PACKAGE_FILE_NAME}"
+
           if [ ! -f "${handoff}/dependencies.json" ]; then
             echo "::error::The build handed over no dependency list, and the Platform refuses a build without one."
             exit 1
           fi
+
           cp "${handoff}/dependencies.json" "${upload}/dependencies.json"
+
           # Optional, and sent as the suite wrote them: the Platform never refuses a build over one, and
           # shows the moderator a report it cannot read as such. One per platform, named after it, so
           # the review shows each in a tab of its own.
           reports=""
+
+          echo "Downloaded conformance reports:"
+          find "${RUNNER_TEMP}/conformance" -type f -print 2>/dev/null || true
+
+          echo "Expected stub host RIDs:"
+          jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}"
+
           while read -r rid; do
             [ -n "${rid}" ] || continue
+
             report="${RUNNER_TEMP}/conformance/${CONFORMANCE_PREFIX}${rid}/conformance.json"
+
             if [ -f "${report}" ]; then
               mkdir -p "${upload}/conformance"
               cp "${report}" "${upload}/conformance/${rid}.json"
               reports="${reports:+${reports}, }${rid}"
+            else
+              echo "::warning::No conformance report found for ${rid}: ${report}"
             fi
           done < <(jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}")
+
           if [ -n "${reports}" ]; then
             echo "Uploading the conformance reports of ${reports}."
           else
             echo "::warning::No conformance report is uploaded: the plugin was not run on a stub host. The moderator is told so."
           fi
+
           jq -n \
             --arg packageId "${package_id}" \
             --arg version "${DECLARED_VERSION#v}" \
             --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
             --arg artifactFileName "${PACKAGE_FILE_NAME}" \
             --arg changelog "${CHANGELOG}" \
-            '{schemaVersion: 1, packageId: $packageId, version: $version, build: $build,
-              artifactFileName: $artifactFileName, changelog: $changelog}' \
+            '{
+              schemaVersion: 1,
+              packageId: $packageId,
+              version: $version,
+              build: $build,
+              artifactFileName: $artifactFileName,
+              changelog: $changelog
+            }' \
             > "${upload}/build-metadata.json"
+
           (cd "${upload}" && zip -q -r ../build.zip .)
 
       # Requested as late as possible: the token is short-lived.
