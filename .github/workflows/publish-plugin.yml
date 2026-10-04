@@ -307,6 +307,7 @@ jobs:
       handoff: ${{ steps.handoff.outputs.name }}
       package-file-name: ${{ steps.build.outputs.package-file-name }}
       sha256: ${{ steps.digest.outputs.sha256 }}
+      cli-version: ${{ steps.cli.outputs.version }}
     steps:
       # Pinned to the commit the workflow was called for rather than to a moving ref. The token
       # attests to github.sha, so building anything else would make the attestation a false
@@ -321,6 +322,20 @@ jobs:
         uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
         with:
           cli-version: ${{ inputs.cli-version }}
+
+      # What was installed rather than what was asked for: an empty cli-version installs the setup
+      # action's own default. Sent with the build, so the moderator sees which CLI made the package.
+      - name: Record the CLI version
+        id: cli
+        run: |
+          set -euo pipefail
+          version="$(dotnet tool list --global | awk 'tolower($1) == "macrodeck.plugin.cli" { print $2 }')"
+          if [ -z "${version}" ]; then
+            echo "::error::MacroDeck.Plugin.Cli is not installed as a global tool."
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Using MacroDeck.Plugin.Cli ${version}."
 
       - name: Build and pack
         id: build
@@ -564,6 +579,7 @@ jobs:
       handoff: ${{ steps.handoff.outputs.name }}
       package-file-name: ${{ steps.merge.outputs.package-file-name }}
       sha256: ${{ steps.digest.outputs.sha256 }}
+      cli-version: ${{ steps.cli.outputs.version }}
     steps:
       - name: Download the platform packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -597,6 +613,20 @@ jobs:
         uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
         with:
           cli-version: ${{ inputs.cli-version }}
+
+      # What was installed rather than what was asked for: an empty cli-version installs the setup
+      # action's own default. Sent with the build, so the moderator sees which CLI made the package.
+      - name: Record the CLI version
+        id: cli
+        run: |
+          set -euo pipefail
+          version="$(dotnet tool list --global | awk 'tolower($1) == "macrodeck.plugin.cli" { print $2 }')"
+          if [ -z "${version}" ]; then
+            echo "::error::MacroDeck.Plugin.Cli is not installed as a global tool."
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Using MacroDeck.Plugin.Cli ${version}."
 
       - name: Merge them into one package
         id: merge
@@ -790,6 +820,8 @@ jobs:
       HANDOFF: ${{ needs.package.outputs.handoff || needs.build.outputs.handoff }}
       PACKAGE_FILE_NAME: ${{ needs.package.outputs.package-file-name || needs.build.outputs.package-file-name }}
       SHA256: ${{ needs.package.outputs.sha256 || needs.build.outputs.sha256 }}
+      # The CLI that made the package: the merge's when there was one, the build's otherwise.
+      CLI_VERSION: ${{ needs.package.outputs.cli-version || needs.build.outputs.cli-version }}
     steps:
       - name: Download the package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -806,8 +838,8 @@ jobs:
           pattern: ${{ needs.plan.outputs.handoff-prefix }}-conformance-*
           path: ${{ runner.temp }}/conformance
 
-      # build-metadata.json says which Project this upload is for, which version and build it is,
-      # and nothing else. The package identifier is the id in the package's own manifest.json, so the
+      # build-metadata.json says which Project this upload is for, which version and build it is, and
+      # which CLI made it. The package identifier is the id in the package's own manifest.json, so the
       # upload can never name a different package than the one it contains. Every provenance value -
       # repository, commit, tag, run - is read from the OIDC token by the Platform, so writing them here
       # would achieve nothing: they are ignored.
@@ -893,13 +925,15 @@ jobs:
             --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
             --arg artifactFileName "${PACKAGE_FILE_NAME}" \
             --arg changelog "${CHANGELOG}" \
+            --arg cliVersion "${CLI_VERSION}" \
             '{
               schemaVersion: 1,
               packageId: $packageId,
               version: $version,
               build: $build,
               artifactFileName: $artifactFileName,
-              changelog: $changelog
+              changelog: $changelog,
+              cliVersion: (if $cliVersion == "" then null else $cliVersion end)
             }' \
             > "${upload}/build-metadata.json"
 
