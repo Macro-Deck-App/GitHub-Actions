@@ -796,9 +796,10 @@ jobs:
           exit "${status}"
 
       # Written by the job that ran the plugin, so the Platform treats it as advisory: the moderator reads
-      # it, it never decides anything.
+      # it, it never decides anything. Kept after a failed check too, so the failing result can be read
+      # from the run's artifacts; the upload job only runs after every stub host passed.
       - name: Hand the report over
-        if: ${{ matrix.rid != '' }}
+        if: ${{ always() && matrix.rid != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ needs.plan.outputs.handoff-prefix }}-conformance-${{ matrix.rid }}
